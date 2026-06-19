@@ -41,9 +41,14 @@ class RequestError(Exception):
     super().__init__(payload.get("error", status.phrase))
 
 
-def _json_param(params: Params, key: str) -> dict[str, Any] | None:
+def _typed_json_param(params: Params, key: str) -> dict[str, Any] | None:
+  value = params.get(key)
+  return value if isinstance(value, dict) else None
+
+
+def _string_json_param(params: Params, key: str) -> dict[str, Any] | None:
   raw = params.get(key)
-  if not raw:
+  if not isinstance(raw, str) or not raw:
     return None
   try:
     value = json.loads(raw)
@@ -54,7 +59,7 @@ def _json_param(params: Params, key: str) -> dict[str, Any] | None:
 
 def _current_origin(params: Params) -> dict[str, Any] | None:
   for key in ("LastGPSPositionLLK", "LastGPSPosition"):
-    pos = _json_param(params, key)
+    pos = _string_json_param(params, key)
     if pos is None:
       continue
     lat = pos.get("latitude")
@@ -161,33 +166,32 @@ def _http_json(request: Request, timeout: int) -> tuple[int, dict[str, Any]]:
     return e.code, payload
 
 
-def _fetch_speed_limits(api_key: str, encoded_polyline: str) -> dict[str, Any]:
+def _fetch_speed_limits(api_key: str, encoded_polyline: str) -> dict[str, Any] | None:
   if not encoded_polyline:
     cloudlog.warning("navrecorder: skipping speed limits, route polyline missing")
-    return {"status": "skipped", "reason": "missing route polyline"}
+    return None
 
   points = _sample_points(_decode_polyline(encoded_polyline))
   if not points:
     cloudlog.warning("navrecorder: skipping speed limits, decoded route polyline is empty")
-    return {"status": "skipped", "reason": "empty route polyline"}
+    return None
 
   path = "|".join(f"{lat:.6f},{lng:.6f}" for lat, lng in points)
-  request_info = {"pathPointCount": len(points), "units": "MPH"}
   url = f"{ROADS_SPEED_LIMITS_URL}?{urlencode({'path': path, 'units': 'MPH', 'key': api_key})}"
   cloudlog.info("navrecorder: requesting Roads speed limits for %d sampled route points", len(points))
   try:
     status, body = _http_json(Request(url), timeout=20)
     if status >= 400:
-      cloudlog.warning("navrecorder: Roads speed limits failed http_status=%d point_count=%d", status, len(points))
-      return {"status": "error", "httpStatus": status, "request": request_info, "response": body}
+      cloudlog.warning("navrecorder: speed limits unavailable http_status=%d; continuing without them", status)
+      return None
     speed_limit_count = len(body.get("speedLimits", [])) if isinstance(body.get("speedLimits"), list) else 0
     warning = body.get("warningMessage") or body.get("warning_message")
     cloudlog.info("navrecorder: Roads speed limits succeeded point_count=%d speed_limit_count=%d warning=%s",
                   len(points), speed_limit_count, warning or "none")
-    return {"status": "ok", "request": request_info, "response": body}
-  except (OSError, URLError, TimeoutError) as e:
-    cloudlog.exception("failed to fetch Google Roads speed limits")
-    return {"status": "error", "request": request_info, "error": str(e)}
+    return body
+  except (OSError, URLError, TimeoutError):
+    cloudlog.warning("navrecorder: speed limits unavailable due to request error; continuing without them", exc_info=True)
+    return None
 
 
 def _compute_route(api_key: str, origin: dict[str, Any], destination: dict[str, Any], avoid: dict[str, Any]) -> dict[str, Any]:
@@ -236,8 +240,8 @@ def _compute_route(api_key: str, origin: dict[str, Any], destination: dict[str, 
 
 def _status() -> dict[str, Any]:
   params = Params()
-  pending = _json_param(params, "PendingNavigationRecording")
-  last = _json_param(params, "LastNavigationRecording")
+  pending = _typed_json_param(params, "PendingNavigationRecording")
+  last = _typed_json_param(params, "LastNavigationRecording")
   current_route = params.get("CurrentRoute")
   pending_route = (pending or {}).get("routeName")
   return {
@@ -296,6 +300,15 @@ def _plan_route(body: dict[str, Any]) -> dict[str, Any]:
   cloudlog.info("navrecorder: route summary distance_m=%s duration=%s step_count=%d",
                 route.get("distanceMeters"), route.get("duration"), len(steps))
   speed_limits = _fetch_speed_limits(api_key, _route_polyline(route))
+  summary = {
+    "distanceMeters": route.get("distanceMeters"),
+    "duration": route.get("duration"),
+    "encodedPolyline": _route_polyline(route),
+    "steps": steps,
+  }
+  if speed_limits is not None:
+    summary["speedLimits"] = speed_limits
+
   snapshot = {
     "schemaVersion": 1,
     "createdAtUnixSeconds": math.floor(time.time()),
@@ -306,25 +319,19 @@ def _plan_route(body: dict[str, Any]) -> dict[str, Any]:
     "originText": body.get("origin") if isinstance(body.get("origin"), str) else None,
     "destinationText": body.get("destination") if isinstance(body.get("destination"), str) else None,
     "routes": routes_response,
-    "summary": {
-      "distanceMeters": route.get("distanceMeters"),
-      "duration": route.get("duration"),
-      "encodedPolyline": _route_polyline(route),
-      "steps": steps,
-      "speedLimits": speed_limits,
-    },
+    "summary": summary,
   }
-  params.put("PendingNavigationRecording", json.dumps(snapshot, separators=(",", ":")))
-  cloudlog.info("navrecorder: pending navigation snapshot saved route=%s destination_set=%s speed_limits_status=%s",
+  params.put("PendingNavigationRecording", snapshot)
+  cloudlog.info("navrecorder: pending navigation snapshot saved route=%s destination_set=%s speed_limits_included=%s",
                 current_route or "next-route", bool(snapshot["destinationText"] or snapshot["destination"]),
-                speed_limits.get("status"))
+                speed_limits is not None)
 
   return {
     "ok": True,
     "distanceMeters": snapshot["summary"]["distanceMeters"],
     "duration": snapshot["summary"]["duration"],
     "stepCount": len(snapshot["summary"]["steps"]),
-    "speedLimitsStatus": speed_limits.get("status"),
+    "speedLimitsIncluded": speed_limits is not None,
     "currentRoute": snapshot["routeName"],
     "message": "Navigation data will be written once to navigation.json for the current or next recording route.",
   }
