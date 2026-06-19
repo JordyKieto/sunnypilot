@@ -59,6 +59,28 @@
         padding: 16px;
         margin-bottom: 14px;
       }
+      .map-shell {
+        padding: 0;
+        overflow: hidden;
+      }
+      .map-frame {
+        width: 100%;
+        height: 420px;
+        border: 0;
+        display: block;
+        background: #cfd6de;
+      }
+      .map-meta {
+        display: flex;
+        gap: 8px 14px;
+        flex-wrap: wrap;
+        padding: 12px 16px 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .map-meta span {
+        white-space: nowrap;
+      }
       label {
         display: block;
         color: var(--muted);
@@ -95,6 +117,15 @@
         width: 18px;
         min-height: 18px;
       }
+      .mini-row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .mini-row button {
+        width: auto;
+        flex: 1 1 160px;
+      }
       button {
         width: 100%;
         min-height: 48px;
@@ -124,6 +155,13 @@
       <h1>Navigation Recorder</h1>
       <p class="sub">Enter a destination before driving. The route snapshot is saved once with the recording.</p>
 
+      <section class="map-shell">
+        <div id="routeMap" class="map-frame" aria-label="Planned route map"></div>
+        <div class="map-meta" id="mapMeta">
+          <span>Map not ready</span>
+        </div>
+      </section>
+
       <section>
         <div class="field">
           <label for="apiKey">Google Maps API key</label>
@@ -146,7 +184,10 @@
           <label class="check"><input id="avoidHighways" type="checkbox">Avoid highways</label>
           <label class="check"><input id="avoidFerries" type="checkbox">Avoid ferries</label>
         </div>
-        <button id="start" type="button">Plan Route for Recording</button>
+        <div class="mini-row">
+          <button id="start" type="button">Plan Route for Recording</button>
+          <button id="clearNav" type="button">Clear Pending Nav</button>
+        </div>
       </section>
 
       <section>
@@ -154,10 +195,25 @@
       </section>
     </main>
 
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    >
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
       const $ = (id) => document.getElementById(id);
       const statusEl = $("status");
-      const buttons = [$("saveKey"), $("start")];
+      const routeMapEl = $("routeMap");
+      const mapMetaEl = $("mapMeta");
+      const buttons = [$("saveKey"), $("start"), $("clearNav")];
+      const MAP_REFRESH_MS = 15000;
+      let lastStatus = null;
+      let lastMapKey = "";
+      let map = null;
+      let destinationMarker = null;
+      let currentMarker = null;
+      let routeLine = null;
+      let mapReady = false;
 
       function setBusy(busy) {
         buttons.forEach((button) => button.disabled = busy);
@@ -166,6 +222,181 @@
       function show(value, ok = true) {
         statusEl.className = ok ? "ok" : "error";
         statusEl.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      }
+
+      function decodePolyline(encoded) {
+        const points = [];
+        let index = 0;
+        let lat = 0;
+        let lng = 0;
+        while (index < encoded.length) {
+          let result = 0;
+          let shift = 0;
+          let b;
+          do {
+            b = encoded.charCodeAt(index++) - 63;
+            result |= (b & 0x1f) << shift;
+            shift += 5;
+          } while (b >= 0x20);
+          const dlat = result & 1 ? ~(result >> 1) : result >> 1;
+          lat += dlat;
+          result = 0;
+          shift = 0;
+          do {
+            b = encoded.charCodeAt(index++) - 63;
+            result |= (b & 0x1f) << shift;
+            shift += 5;
+          } while (b >= 0x20);
+          const dlng = result & 1 ? ~(result >> 1) : result >> 1;
+          lng += dlng;
+          points.push([lat / 1e5, lng / 1e5]);
+        }
+        return points;
+      }
+
+      function pointText(point) {
+        return `${point.latitude.toFixed(5)}, ${point.longitude.toFixed(5)}`;
+      }
+
+      function parseDestination(value) {
+        const raw = String(value || "").trim();
+        const match = raw.match(/^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$/);
+        if (match) {
+          const latitude = Number(match[1]);
+          const longitude = Number(match[2]);
+          if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+            return {latitude, longitude};
+          }
+        }
+        return raw || null;
+      }
+
+      function toLatLng(point) {
+        if (!point || typeof point.latitude !== "number" || typeof point.longitude !== "number") {
+          return null;
+        }
+        return [point.latitude, point.longitude];
+      }
+
+      function ensureMap() {
+        if (mapReady || !window.L) {
+          return;
+        }
+        map = L.map(routeMapEl, {
+          scrollWheelZoom: true,
+          zoomControl: true,
+        });
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: '&copy; OpenStreetMap contributors',
+          maxZoom: 19,
+        }).addTo(map);
+        map.on("click", (event) => {
+          if (destinationMarker) {
+            destinationMarker.setLatLng(event.latlng);
+          } else {
+            destinationMarker = L.marker(event.latlng, {draggable: true}).addTo(map);
+            destinationMarker.on("dragend", updateDestinationField);
+          }
+          updateDestinationField();
+          show(`Destination set to ${event.latlng.lat.toFixed(6)}, ${event.latlng.lng.toFixed(6)}`, true);
+        });
+        mapReady = true;
+      }
+
+      function updateDestinationField() {
+        if (!destinationMarker) {
+          return;
+        }
+        const {lat, lng} = destinationMarker.getLatLng();
+        $("destination").value = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+        updateMap(lastStatus);
+      }
+
+      function fitMap(points) {
+        if (!map || !points.length) {
+          return;
+        }
+        const bounds = L.latLngBounds(points);
+        map.fitBounds(bounds.pad(0.15));
+      }
+
+      function clearRouteOverlay() {
+        if (routeLine) {
+          routeLine.remove();
+          routeLine = null;
+        }
+      }
+
+      function updateMap(status) {
+        ensureMap();
+        if (!map) {
+          return;
+        }
+
+        const currentGps = toLatLng(status?.currentGps);
+        if (currentGps && (!map.getCenter() || !map._loaded)) {
+          map.setView(currentGps, 16);
+        }
+        if (currentMarker) {
+          currentMarker.remove();
+          currentMarker = null;
+        }
+        if (currentGps) {
+          currentMarker = L.circleMarker(currentGps, {
+            radius: 7,
+            color: "#126e5c",
+            weight: 2,
+            fillColor: "#20a486",
+            fillOpacity: 1,
+          }).addTo(map);
+        }
+
+        if (!destinationMarker) {
+          const destination = toLatLng(status?.pendingDestination) || toLatLng(status?.currentGps);
+          if (destination) {
+            destinationMarker = L.marker(destination, {draggable: true}).addTo(map);
+            destinationMarker.on("dragend", updateDestinationField);
+            $("destination").value = `${destination[0].toFixed(6)},${destination[1].toFixed(6)}`;
+          }
+        }
+
+        clearRouteOverlay();
+        const encodedPolyline = status?.pendingEncodedPolyline;
+        if (encodedPolyline) {
+          routeLine = L.polyline(decodePolyline(encodedPolyline), {
+            color: "#126e5c",
+            weight: 5,
+            opacity: 0.9,
+          }).addTo(map);
+        }
+
+        const layers = [];
+        if (currentGps) {
+          layers.push(currentGps);
+        }
+        if (destinationMarker) {
+          layers.push(destinationMarker.getLatLng());
+        }
+        if (routeLine) {
+          fitMap(routeLine.getLatLngs());
+        } else if (layers.length) {
+          if (currentGps && layers.length === 1) {
+            map.setView(currentGps, Math.max(map.getZoom() || 16, 16));
+          } else {
+            fitMap(layers);
+          }
+        }
+
+        const destinationText = $("destination").value.trim() || "unset";
+        const originText = $("origin").value.trim() || "current GPS";
+        const routeLabel = status?.pendingRoute || status?.currentRoute || "route";
+        const gpsLabel = currentGps ? `current ${pointText(status.currentGps)}` : "current location unavailable";
+        mapMetaEl.innerHTML = `
+          <span>${routeLabel}</span>
+          <span>origin ${originText}</span>
+          <span>destination ${destinationText}</span>
+          <span>${gpsLabel}</span>
+        `;
       }
 
       async function request(path, options = {}) {
@@ -189,7 +420,9 @@
       async function refresh() {
         try {
           const body = await request("/status");
+          lastStatus = body;
           show(body, true);
+          updateMap(body);
         } catch (e) {
           show(e, false);
         }
@@ -210,12 +443,13 @@
       $("start").addEventListener("click", async () => {
         setBusy(true);
         try {
+          const destination = parseDestination($("destination").value);
           const body = await request("/route", {
             method: "POST",
             body: JSON.stringify({
               apiKey: $("apiKey").value,
               origin: $("origin").value || null,
-              destination: $("destination").value,
+              destination,
               avoid: {
                 tolls: $("avoidTolls").checked,
                 highways: $("avoidHighways").checked,
@@ -224,6 +458,22 @@
             }),
           });
           show(body, true);
+          await refresh();
+        } catch (e) {
+          show(e, false);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      $("clearNav").addEventListener("click", async () => {
+        setBusy(true);
+        try {
+          const body = await request("/clear_nav", {method: "POST", body: "{}"});
+          show(body, true);
+          clearRouteOverlay();
+          lastMapKey = "";
+          await refresh();
         } catch (e) {
           show(e, false);
         } finally {
@@ -232,6 +482,13 @@
       });
 
       refresh();
+      setInterval(() => {
+        if (lastStatus && (lastStatus.hasPendingNavigation || lastStatus.currentRoute || lastStatus.currentGps)) {
+          refresh();
+        }
+      }, MAP_REFRESH_MS);
+
+      window.addEventListener("load", ensureMap);
     </script>
   </body>
 </html>

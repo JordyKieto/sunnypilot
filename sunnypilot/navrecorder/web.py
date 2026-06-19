@@ -244,14 +244,19 @@ def _status() -> dict[str, Any]:
   last = _typed_json_param(params, "LastNavigationRecording")
   current_route = params.get("CurrentRoute")
   pending_route = (pending or {}).get("routeName")
+  current_gps = _string_json_param(params, "LastGPSPositionLLK") or _string_json_param(params, "LastGPSPosition")
   return {
     "hasApiKey": bool(params.get("GoogleMapsApiKey")),
     "currentRoute": current_route,
     "hasPendingNavigation": pending is not None,
     "pendingRoute": pending_route,
     "pendingDestination": (pending or {}).get("destinationText"),
+    "pendingOrigin": (pending or {}).get("originText") or (pending or {}).get("origin"),
+    "pendingEncodedPolyline": ((pending or {}).get("summary") or {}).get("encodedPolyline"),
+    "pendingStepCount": len(((pending or {}).get("summary") or {}).get("steps") or []),
     "lastRecordedRoute": (last or {}).get("routeName"),
     "lastDestination": (last or {}).get("destinationText"),
+    "currentGps": current_gps,
   }
 
 
@@ -333,8 +338,18 @@ def _plan_route(body: dict[str, Any]) -> dict[str, Any]:
     "stepCount": len(snapshot["summary"]["steps"]),
     "speedLimitsIncluded": speed_limits is not None,
     "currentRoute": snapshot["routeName"],
+    "origin": snapshot["origin"],
+    "destination": snapshot["destination"],
+    "encodedPolyline": snapshot["summary"]["encodedPolyline"],
     "message": "Navigation data will be written once to navigation.json for the current or next recording route.",
   }
+
+
+def _clear_pending_navigation() -> dict[str, Any]:
+  params = Params()
+  params.remove("PendingNavigationRecording")
+  cloudlog.info("navrecorder: cleared pending navigation recording")
+  return {"ok": True, "message": "Pending navigation cleared."}
 
 
 class NavRecorderHandler(SimpleHTTPRequestHandler):
@@ -378,6 +393,8 @@ class NavRecorderHandler(SimpleHTTPRequestHandler):
         self._send_json(_save_api_key(body))
       elif self.path == "/route":
         self._send_json(_plan_route(body))
+      elif self.path == "/clear_nav":
+        self._send_json(_clear_pending_navigation())
       else:
         raise RequestError(HTTPStatus.NOT_FOUND, {"error": "not found"})
     except RequestError as e:
