@@ -119,6 +119,14 @@
       }
       .origin-dot { background: #1d4ed8; }
       .destination-dot { background: #b91c1c; }
+      .vehicle-arrow {
+        width: 0;
+        height: 0;
+        border-left: 6px solid transparent;
+        border-right: 6px solid transparent;
+        border-bottom: 16px solid #1d4ed8;
+        filter: drop-shadow(0 0 1px #ffffff);
+      }
       .route-dot {
         width: 28px;
         height: 4px;
@@ -205,7 +213,8 @@
 
       <section class="map-shell">
         <div class="map-legend" id="mapLegend" aria-label="Map legend">
-          <span class="legend-item"><span class="legend-dot origin-dot">O</span>Origin</span>
+          <span class="legend-item"><span class="vehicle-arrow"></span>Live position</span>
+          <span class="legend-item"><span class="legend-dot origin-dot">O</span>Manual origin</span>
           <span class="legend-item"><span class="legend-dot destination-dot">D</span>Destination</span>
           <span class="legend-item"><span class="route-dot"></span>Route</span>
         </div>
@@ -260,7 +269,8 @@
       const routeMapEl = $("routeMap");
       const mapMetaEl = $("mapMeta");
       const buttons = [$("saveKey"), $("start"), $("clearNav")];
-      const MAP_REFRESH_MS = 15000;
+      const STATUS_REFRESH_MS = 10000;
+      const LIVE_ROUTE_REFRESH_MS = 60000;
       const DEFAULT_CENTER = {lat: 37.7749, lng: -122.4194};
       const DEBUG_LIMIT = 80;
       let lastStatus = null;
@@ -269,6 +279,7 @@
       let destinationMarker = null;
       let currentMarker = null;
       let routeLine = null;
+      let renderedRoutePolyline = "";
       let markerInfoWindow = null;
       let geocoder = null;
       let hoverAddressTimer = null;
@@ -277,6 +288,8 @@
       let previewTimer = null;
       let previewRequestId = 0;
       let lastPreviewKey = "";
+      let lastPreviewBaseKey = "";
+      let lastLiveRoutePreviewAt = 0;
       let mapReady = false;
       let googleMapsPromise = null;
       let googleMapsLoadedKey = "";
@@ -382,6 +395,11 @@
         return {lat: point.latitude, lng: point.longitude};
       }
 
+      function headingDeg(point) {
+        const value = point?.bearingDeg ?? point?.bearing ?? point?.heading;
+        return Number.isFinite(value) ? ((Number(value) % 360) + 360) % 360 : null;
+      }
+
       function waypointLatLng(waypoint) {
         const latLng = waypoint?.location?.latLng;
         if (!latLng || typeof latLng.latitude !== "number" || typeof latLng.longitude !== "number") {
@@ -409,7 +427,19 @@
         return Number.isFinite(lat) && Number.isFinite(lng) ? {lat, lng} : null;
       }
 
-      function markerIcon(kind) {
+      function markerIcon(kind, heading = null) {
+        if (kind === "live") {
+          return {
+            path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+            scale: 5,
+            rotation: Number.isFinite(heading) ? heading : 0,
+            fillColor: "#1d4ed8",
+            fillOpacity: 1,
+            strokeColor: "#ffffff",
+            strokeWeight: 2,
+            anchor: new google.maps.Point(0, 2),
+          };
+        }
         const isOrigin = kind === "origin";
         return {
           path: google.maps.SymbolPath.CIRCLE,
@@ -422,6 +452,9 @@
       }
 
       function markerLabel(kind) {
+        if (kind === "live") {
+          return null;
+        }
         return {
           text: kind === "origin" ? "O" : "D",
           color: "#ffffff",
@@ -522,26 +555,33 @@
         }
       }
 
-      function makeEndpointMarker(kind, position, draggable = false) {
-        const title = kind === "origin" ? "Origin" : "Destination";
+      function markerTitle(kind) {
+        if (kind === "live") {
+          return "Live position";
+        }
+        return kind === "origin" ? "Manual origin" : "Destination";
+      }
+
+      function makeEndpointMarker(kind, position, draggable = false, heading = null) {
+        const title = markerTitle(kind);
         const marker = new google.maps.Marker({
           position,
           map,
           draggable,
           title: `${title}: ${describePoint(position)}`,
-          icon: markerIcon(kind),
+          icon: markerIcon(kind, heading),
           label: markerLabel(kind),
         });
         applyMarkerInfo(marker, title, describePoint(position));
         return marker;
       }
 
-      function updateEndpointMarker(marker, kind, position) {
+      function updateEndpointMarker(marker, kind, position, heading = null) {
         marker.setPosition(position);
-        marker.setIcon(markerIcon(kind));
+        marker.setIcon(markerIcon(kind, heading));
         marker.setLabel(markerLabel(kind));
-        marker.setDraggable(kind !== "origin" || Boolean($("origin").value.trim()) || routeLine !== null);
-        applyMarkerInfo(marker, kind === "origin" ? "Origin" : "Destination", describePoint(position));
+        marker.setDraggable(kind === "destination" || kind === "origin");
+        applyMarkerInfo(marker, markerTitle(kind), describePoint(position));
       }
 
       window.__navRecorderGoogleMapsLoaded = () => {
@@ -668,6 +708,37 @@
         schedulePreviewRoute();
       }
 
+      function currentLivePosition() {
+        return toLatLng(lastStatus?.currentGps);
+      }
+
+      function updateLiveMarker(position = currentLivePosition()) {
+        if (!position || !map) {
+          return;
+        }
+        const heading = headingDeg(lastStatus?.currentGps);
+        if (currentMarker) {
+          updateEndpointMarker(currentMarker, "live", position, heading);
+        } else {
+          currentMarker = makeEndpointMarker("live", position, false, heading);
+        }
+      }
+
+      function updateManualOriginMarker(position) {
+        if (!position || !map) {
+          return;
+        }
+        if (currentMarker) {
+          updateEndpointMarker(currentMarker, "origin", position);
+        } else {
+          currentMarker = makeEndpointMarker("origin", position, true);
+        }
+        if (!currentMarker.navRecorderOriginDragReady) {
+          currentMarker.addListener("dragend", updateOriginField);
+          currentMarker.navRecorderOriginDragReady = true;
+        }
+      }
+
       function fitMap(points) {
         if (!map || !points.length) {
           return;
@@ -682,14 +753,23 @@
           routeLine.setMap(null);
           routeLine = null;
         }
+        renderedRoutePolyline = "";
       }
 
       function clearPreviewRoute() {
         clearRouteOverlay();
         lastPreviewKey = "";
+        lastPreviewBaseKey = "";
       }
 
       function renderEncodedRoute(encodedPolyline, resetPreviewKey = true) {
+        if (routeLine && renderedRoutePolyline === encodedPolyline) {
+          const liveOrigin = currentLivePosition();
+          if (!$("origin").value.trim() && liveOrigin) {
+            updateLiveMarker(liveOrigin);
+          }
+          return;
+        }
         clearRouteOverlay();
         if (resetPreviewKey) {
           lastPreviewKey = "";
@@ -703,16 +783,19 @@
           strokeWeight: 5,
           map,
         });
+        renderedRoutePolyline = encodedPolyline;
         const originPoint = routePoints[0];
         const destinationPoint = routePoints[routePoints.length - 1];
         if (originPoint) {
-          if (currentMarker) {
-            updateEndpointMarker(currentMarker, "origin", originPoint);
+          const manualOrigin = parseLatLngText($("origin").value);
+          const liveOrigin = currentLivePosition();
+          if (manualOrigin) {
+            updateManualOriginMarker(originPoint);
+          } else if (liveOrigin) {
+            updateLiveMarker(liveOrigin);
           } else {
-            currentMarker = makeEndpointMarker("origin", originPoint, true);
-            currentMarker.addListener("dragend", updateOriginField);
+            updateManualOriginMarker(originPoint);
           }
-          currentMarker.setDraggable(true);
         }
         if (destinationPoint) {
           if (destinationMarker) {
@@ -753,11 +836,32 @@
             ferries: $("avoidFerries").checked,
           },
         };
-        const previewKey = safeJson(requestBody);
-        if (previewKey === lastPreviewKey) {
+        const usingLiveOrigin = !origin;
+        const previewBaseKey = safeJson(requestBody);
+        const now = Date.now();
+        if (
+          usingLiveOrigin &&
+          previewBaseKey === lastPreviewBaseKey &&
+          lastLiveRoutePreviewAt &&
+          now - lastLiveRoutePreviewAt < LIVE_ROUTE_REFRESH_MS
+        ) {
+          return;
+        }
+
+        const livePoint = currentLivePosition();
+        const previewKey = safeJson({
+          ...requestBody,
+          liveOrigin: usingLiveOrigin && livePoint ? {
+            lat: Number(livePoint.lat.toFixed(5)),
+            lng: Number(livePoint.lng.toFixed(5)),
+            heading: Math.round(headingDeg(lastStatus?.currentGps) || 0),
+          } : null,
+        });
+        if (!usingLiveOrigin && previewKey === lastPreviewKey) {
           return;
         }
         lastPreviewKey = previewKey;
+        lastPreviewBaseKey = previewBaseKey;
         const requestId = ++previewRequestId;
         clearRouteOverlay();
         debug("Requesting route preview", {
@@ -780,6 +884,9 @@
             return;
           }
           renderEncodedRoute(body.encodedPolyline, false);
+          if (usingLiveOrigin) {
+            lastLiveRoutePreviewAt = Date.now();
+          }
           debug("Route preview rendered", {
             distanceMeters: body.distanceMeters,
             duration: body.duration,
@@ -805,7 +912,9 @@
         const destinationText = $("destination").value.trim() || "unset";
         const originText = $("origin").value.trim() || "current GPS";
         const routeLabel = lastStatus?.pendingRoute || lastStatus?.currentRoute || "route";
-        const gpsLabel = currentGps && lastStatus?.currentGps ? `current ${pointText(lastStatus.currentGps)}` : "current location unavailable";
+        const heading = headingDeg(lastStatus?.currentGps);
+        const headingText = heading === null ? "" : ` heading ${Math.round(heading)}deg`;
+        const gpsLabel = currentGps && lastStatus?.currentGps ? `live ${pointText(lastStatus.currentGps)}${headingText}` : "live location unavailable";
         mapMetaEl.innerHTML = `
           <span>${routeLabel}</span>
           <span>origin ${originText}</span>
@@ -823,16 +932,13 @@
 
         const currentGps = toLatLng(status?.currentGps);
         const originOverride = parseLatLngText($("origin").value);
-        const originPosition = originOverride || currentGps;
-        if (!routeLine) {
-          if (currentMarker) {
-            currentMarker.setMap(null);
-            currentMarker = null;
-          }
-          if (originPosition) {
-            currentMarker = makeEndpointMarker("origin", originPosition, true);
-            currentMarker.addListener("dragend", updateOriginField);
-          }
+        if (originOverride) {
+          updateManualOriginMarker(originOverride);
+        } else if (currentGps) {
+          updateLiveMarker(currentGps);
+        } else if (!routeLine && currentMarker) {
+          currentMarker.setMap(null);
+          currentMarker = null;
         }
 
         if (!destinationMarker) {
@@ -861,9 +967,7 @@
             layers.push(destinationPosition);
           }
         }
-        if (routeLine) {
-          fitMap(routeLine.getPath().getArray());
-        } else if (layers.length) {
+        if (!routeLine && layers.length) {
           if (currentGps && layers.length === 1) {
             map.setCenter(currentGps);
             map.setZoom(Math.max(map.getZoom() || 16, 16));
@@ -1002,7 +1106,7 @@
         if (lastStatus && (lastStatus.hasPendingNavigation || lastStatus.currentRoute || lastStatus.currentGps)) {
           refresh();
         }
-      }, MAP_REFRESH_MS);
+      }, STATUS_REFRESH_MS);
 
       window.addEventListener("error", (event) => {
         debug("Unhandled browser error", {
