@@ -148,6 +148,10 @@
       }
       .error { color: var(--danger); }
       .ok { color: var(--accent); }
+      .debug {
+        max-height: 180px;
+        overflow: auto;
+      }
     </style>
   </head>
   <body>
@@ -193,27 +197,63 @@
       <section>
         <pre id="status">Loading status...</pre>
       </section>
+
+      <section>
+        <label>Debug log</label>
+        <pre id="debugLog" class="debug">Starting...</pre>
+      </section>
     </main>
 
-    <link
-      rel="stylesheet"
-      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    >
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
       const $ = (id) => document.getElementById(id);
       const statusEl = $("status");
+      const debugLogEl = $("debugLog");
       const routeMapEl = $("routeMap");
       const mapMetaEl = $("mapMeta");
       const buttons = [$("saveKey"), $("start"), $("clearNav")];
       const MAP_REFRESH_MS = 15000;
+      const DEFAULT_CENTER = {lat: 37.7749, lng: -122.4194};
+      const DEBUG_LIMIT = 80;
       let lastStatus = null;
-      let lastMapKey = "";
+      let debugLines = [];
       let map = null;
       let destinationMarker = null;
       let currentMarker = null;
       let routeLine = null;
       let mapReady = false;
+      let googleMapsPromise = null;
+      let googleMapsLoadedKey = "";
+      let googleMapsResolve = null;
+      let googleMapsReject = null;
+
+      function safeJson(value) {
+        if (value instanceof Error) {
+          return JSON.stringify({name: value.name, message: value.message, stack: value.stack});
+        }
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return String(value);
+        }
+      }
+
+      function debug(message, context = null, level = "info") {
+        const line = `${new Date().toLocaleTimeString()} ${level.toUpperCase()} ${message}${context ? " " + safeJson(context) : ""}`;
+        debugLines.push(line);
+        debugLines = debugLines.slice(-DEBUG_LIMIT);
+        debugLogEl.textContent = debugLines.join("\n");
+        const logFn = level === "error" ? console.error : level === "warning" ? console.warn : console.log;
+        logFn("[navrecorder]", message, context || "");
+        fetch("/client_log", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({level, message, context}),
+        }).catch(() => {});
+      }
+
+      function setMapMeta(message) {
+        mapMetaEl.innerHTML = `<span>${message}</span>`;
+      }
 
       function setBusy(busy) {
         buttons.forEach((button) => button.disabled = busy);
@@ -249,7 +289,7 @@
           } while (b >= 0x20);
           const dlng = result & 1 ? ~(result >> 1) : result >> 1;
           lng += dlng;
-          points.push([lat / 1e5, lng / 1e5]);
+          points.push({lat: lat / 1e5, lng: lng / 1e5});
         }
         return points;
       }
@@ -260,55 +300,146 @@
 
       function parseDestination(value) {
         const raw = String(value || "").trim();
-        const match = raw.match(/^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$/);
-        if (match) {
-          const latitude = Number(match[1]);
-          const longitude = Number(match[2]);
-          if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
-            return {latitude, longitude};
-          }
+        const point = parseLatLngText(raw);
+        if (point) {
+          return {latitude: point.lat, longitude: point.lng};
         }
         return raw || null;
+      }
+
+      function parseLatLngText(value) {
+        const raw = String(value || "").trim();
+        const match = raw.match(/^(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)$/);
+        if (!match) {
+          return null;
+        }
+        const lat = Number(match[1]);
+        const lng = Number(match[2]);
+        return Number.isFinite(lat) && Number.isFinite(lng) ? {lat, lng} : null;
       }
 
       function toLatLng(point) {
         if (!point || typeof point.latitude !== "number" || typeof point.longitude !== "number") {
           return null;
         }
-        return [point.latitude, point.longitude];
+        return {lat: point.latitude, lng: point.longitude};
+      }
+
+      function waypointLatLng(waypoint) {
+        const latLng = waypoint?.location?.latLng;
+        if (!latLng || typeof latLng.latitude !== "number" || typeof latLng.longitude !== "number") {
+          return null;
+        }
+        return {lat: latLng.latitude, lng: latLng.longitude};
+      }
+
+      function markerPosition(marker) {
+        const position = marker?.getPosition?.();
+        return position ? {lat: position.lat(), lng: position.lng()} : null;
+      }
+
+      window.__navRecorderGoogleMapsLoaded = () => {
+        debug("Google Maps JavaScript API loaded");
+        googleMapsResolve?.();
+      };
+
+      window.gm_authFailure = () => {
+        const message = "Google Maps authentication failed. Check that the key allows Maps JavaScript API for this page.";
+        debug(message, null, "error");
+        setMapMeta(message);
+        googleMapsReject?.(new Error(message));
+      };
+
+      function loadGoogleMaps(apiKey) {
+        const key = String(apiKey || "").trim();
+        if (window.google?.maps) {
+          ensureMap();
+          return Promise.resolve();
+        }
+        if (!key) {
+          const message = "Save a Google Maps API key to load the map.";
+          setMapMeta(message);
+          debug(message, null, "warning");
+          return Promise.reject(new Error(message));
+        }
+        if (googleMapsPromise && googleMapsLoadedKey === key) {
+          return googleMapsPromise;
+        }
+
+        document.getElementById("googleMapsScript")?.remove();
+        googleMapsLoadedKey = key;
+        googleMapsPromise = new Promise((resolve, reject) => {
+          googleMapsResolve = resolve;
+          googleMapsReject = reject;
+          const script = document.createElement("script");
+          script.id = "googleMapsScript";
+          script.async = true;
+          script.defer = true;
+          script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&callback=__navRecorderGoogleMapsLoaded`;
+          script.onerror = () => {
+            const message = "Google Maps JavaScript API script failed to load.";
+            debug(message, {src: script.src.replace(key, "***")}, "error");
+            setMapMeta(message);
+            reject(new Error(message));
+          };
+          debug("Loading Google Maps JavaScript API");
+          document.head.appendChild(script);
+        }).then(() => {
+          ensureMap();
+          updateMap(lastStatus);
+        }).catch((e) => {
+          googleMapsPromise = null;
+          throw e;
+        });
+        return googleMapsPromise;
       }
 
       function ensureMap() {
-        if (mapReady || !window.L) {
+        if (mapReady) {
           return;
         }
-        map = L.map(routeMapEl, {
-          scrollWheelZoom: true,
-          zoomControl: true,
+        if (!window.google?.maps) {
+          setMapMeta("Save API key to load Google Maps.");
+          return;
+        }
+        const currentGps = toLatLng(lastStatus?.currentGps);
+        map = new google.maps.Map(routeMapEl, {
+          center: currentGps || DEFAULT_CENTER,
+          zoom: currentGps ? 16 : 11,
+          mapTypeControl: false,
+          streetViewControl: false,
+          fullscreenControl: true,
         });
-        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-          attribution: '&copy; OpenStreetMap contributors',
-          maxZoom: 19,
-        }).addTo(map);
-        map.on("click", (event) => {
+        map.addListener("click", (event) => {
           if (destinationMarker) {
-            destinationMarker.setLatLng(event.latlng);
+            destinationMarker.setPosition(event.latLng);
           } else {
-            destinationMarker = L.marker(event.latlng, {draggable: true}).addTo(map);
-            destinationMarker.on("dragend", updateDestinationField);
+            destinationMarker = new google.maps.Marker({
+              position: event.latLng,
+              map,
+              draggable: true,
+              title: "Destination",
+            });
+            destinationMarker.addListener("dragend", updateDestinationField);
           }
           updateDestinationField();
-          show(`Destination set to ${event.latlng.lat.toFixed(6)}, ${event.latlng.lng.toFixed(6)}`, true);
+          show(`Destination set to ${event.latLng.lat().toFixed(6)}, ${event.latLng.lng().toFixed(6)}`, true);
+          debug("Destination selected on map", {lat: event.latLng.lat(), lng: event.latLng.lng()});
         });
         mapReady = true;
+        debug("Map initialized");
+        setMapMeta("Map ready. Click the map or enter a destination.");
       }
 
       function updateDestinationField() {
         if (!destinationMarker) {
           return;
         }
-        const {lat, lng} = destinationMarker.getLatLng();
-        $("destination").value = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+        const position = markerPosition(destinationMarker);
+        if (!position) {
+          return;
+        }
+        $("destination").value = `${position.lat.toFixed(6)},${position.lng.toFixed(6)}`;
         updateMap(lastStatus);
       }
 
@@ -316,13 +447,14 @@
         if (!map || !points.length) {
           return;
         }
-        const bounds = L.latLngBounds(points);
-        map.fitBounds(bounds.pad(0.15));
+        const bounds = new google.maps.LatLngBounds();
+        points.forEach((point) => bounds.extend(point));
+        map.fitBounds(bounds, 48);
       }
 
       function clearRouteOverlay() {
         if (routeLine) {
-          routeLine.remove();
+          routeLine.setMap(null);
           routeLine = null;
         }
       }
@@ -330,44 +462,48 @@
       function updateMap(status) {
         ensureMap();
         if (!map) {
+          setMapMeta(status?.hasApiKey ? "Loading Google Maps..." : "Save API key to load Google Maps.");
           return;
         }
 
         const currentGps = toLatLng(status?.currentGps);
-        if (currentGps && (!map.getCenter() || !map._loaded)) {
-          map.setView(currentGps, 16);
-        }
         if (currentMarker) {
-          currentMarker.remove();
+          currentMarker.setMap(null);
           currentMarker = null;
         }
         if (currentGps) {
-          currentMarker = L.circleMarker(currentGps, {
-            radius: 7,
-            color: "#126e5c",
-            weight: 2,
-            fillColor: "#20a486",
-            fillOpacity: 1,
-          }).addTo(map);
+          currentMarker = new google.maps.Marker({
+            position: currentGps,
+            map,
+            title: "Current GPS",
+          });
         }
 
         if (!destinationMarker) {
-          const destination = toLatLng(status?.pendingDestination) || toLatLng(status?.currentGps);
+          const destination = waypointLatLng(status?.pendingDestinationWaypoint) || parseLatLngText(status?.pendingDestination);
           if (destination) {
-            destinationMarker = L.marker(destination, {draggable: true}).addTo(map);
-            destinationMarker.on("dragend", updateDestinationField);
-            $("destination").value = `${destination[0].toFixed(6)},${destination[1].toFixed(6)}`;
+            destinationMarker = new google.maps.Marker({
+              position: destination,
+              map,
+              draggable: true,
+              title: "Destination",
+            });
+            destinationMarker.addListener("dragend", updateDestinationField);
+            $("destination").value = `${destination.lat.toFixed(6)},${destination.lng.toFixed(6)}`;
           }
         }
 
         clearRouteOverlay();
         const encodedPolyline = status?.pendingEncodedPolyline;
         if (encodedPolyline) {
-          routeLine = L.polyline(decodePolyline(encodedPolyline), {
-            color: "#126e5c",
-            weight: 5,
-            opacity: 0.9,
-          }).addTo(map);
+          routeLine = new google.maps.Polyline({
+            path: decodePolyline(encodedPolyline),
+            geodesic: true,
+            strokeColor: "#126e5c",
+            strokeOpacity: 0.9,
+            strokeWeight: 5,
+            map,
+          });
         }
 
         const layers = [];
@@ -375,13 +511,17 @@
           layers.push(currentGps);
         }
         if (destinationMarker) {
-          layers.push(destinationMarker.getLatLng());
+          const destinationPosition = markerPosition(destinationMarker);
+          if (destinationPosition) {
+            layers.push(destinationPosition);
+          }
         }
         if (routeLine) {
-          fitMap(routeLine.getLatLngs());
+          fitMap(routeLine.getPath().getArray());
         } else if (layers.length) {
           if (currentGps && layers.length === 1) {
-            map.setView(currentGps, Math.max(map.getZoom() || 16, 16));
+            map.setCenter(currentGps);
+            map.setZoom(Math.max(map.getZoom() || 16, 16));
           } else {
             fitMap(layers);
           }
@@ -422,8 +562,23 @@
           const body = await request("/status");
           lastStatus = body;
           show(body, true);
+          debug("Status refreshed", {
+            hasApiKey: body.hasApiKey,
+            hasPendingNavigation: body.hasPendingNavigation,
+            currentRoute: body.currentRoute,
+            hasCurrentGps: Boolean(body.currentGps),
+          });
+          if (body.hasApiKey && !window.google?.maps && !$("apiKey").value.trim()) {
+            try {
+              const keyBody = await request("/maps_api_key");
+              await loadGoogleMaps(keyBody.apiKey);
+            } catch (e) {
+              debug("Saved API key could not load Google Maps", e, "error");
+            }
+          }
           updateMap(body);
         } catch (e) {
+          debug("Status refresh failed", e, "error");
           show(e, false);
         }
       }
@@ -431,9 +586,13 @@
       $("saveKey").addEventListener("click", async () => {
         setBusy(true);
         try {
-          await request("/api_key", {method: "POST", body: JSON.stringify({apiKey: $("apiKey").value})});
+          const apiKey = $("apiKey").value.trim();
+          await request("/api_key", {method: "POST", body: JSON.stringify({apiKey})});
+          await loadGoogleMaps(apiKey);
           await refresh();
+          show("API key saved. Google map loaded; click the map or enter a destination.", true);
         } catch (e) {
+          debug("Save API key failed", e, "error");
           show(e, false);
         } finally {
           setBusy(false);
@@ -444,10 +603,11 @@
         setBusy(true);
         try {
           const destination = parseDestination($("destination").value);
+          const apiKey = $("apiKey").value.trim();
           const body = await request("/route", {
             method: "POST",
             body: JSON.stringify({
-              apiKey: $("apiKey").value,
+              apiKey: apiKey || null,
               origin: $("origin").value || null,
               destination,
               avoid: {
@@ -460,6 +620,7 @@
           show(body, true);
           await refresh();
         } catch (e) {
+          debug("Route planning failed", e, "error");
           show(e, false);
         } finally {
           setBusy(false);
@@ -472,9 +633,9 @@
           const body = await request("/clear_nav", {method: "POST", body: "{}"});
           show(body, true);
           clearRouteOverlay();
-          lastMapKey = "";
           await refresh();
         } catch (e) {
+          debug("Clear pending navigation failed", e, "error");
           show(e, false);
         } finally {
           setBusy(false);
@@ -488,7 +649,17 @@
         }
       }, MAP_REFRESH_MS);
 
-      window.addEventListener("load", ensureMap);
+      window.addEventListener("error", (event) => {
+        debug("Unhandled browser error", {
+          message: event.message,
+          filename: event.filename,
+          lineno: event.lineno,
+          colno: event.colno,
+        }, "error");
+      });
+      window.addEventListener("unhandledrejection", (event) => {
+        debug("Unhandled promise rejection", event.reason, "error");
+      });
     </script>
   </body>
 </html>

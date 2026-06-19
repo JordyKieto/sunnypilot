@@ -251,6 +251,7 @@ def _status() -> dict[str, Any]:
     "hasPendingNavigation": pending is not None,
     "pendingRoute": pending_route,
     "pendingDestination": (pending or {}).get("destinationText"),
+    "pendingDestinationWaypoint": (pending or {}).get("destination"),
     "pendingOrigin": (pending or {}).get("originText") or (pending or {}).get("origin"),
     "pendingEncodedPolyline": ((pending or {}).get("summary") or {}).get("encodedPolyline"),
     "pendingStepCount": len(((pending or {}).get("summary") or {}).get("steps") or []),
@@ -267,6 +268,13 @@ def _save_api_key(body: dict[str, Any]) -> dict[str, Any]:
   Params().put("GoogleMapsApiKey", api_key.strip())
   cloudlog.info("navrecorder: Google Maps API key saved")
   return {"ok": True}
+
+
+def _maps_api_key() -> dict[str, Any]:
+  api_key = Params().get("GoogleMapsApiKey")
+  if not isinstance(api_key, str) or not api_key.strip():
+    raise RequestError(HTTPStatus.NOT_FOUND, {"error": "Google Maps API key is not saved"})
+  return {"apiKey": api_key.strip()}
 
 
 def _plan_route(body: dict[str, Any]) -> dict[str, Any]:
@@ -352,6 +360,32 @@ def _clear_pending_navigation() -> dict[str, Any]:
   return {"ok": True, "message": "Pending navigation cleared."}
 
 
+def _client_log(body: dict[str, Any]) -> dict[str, Any]:
+  level = body.get("level")
+  message = body.get("message")
+  context = body.get("context")
+  if not isinstance(level, str):
+    level = "info"
+  if not isinstance(message, str) or not message.strip():
+    raise RequestError(HTTPStatus.BAD_REQUEST, {"error": "message is required"})
+
+  context_text = ""
+  if context is not None:
+    try:
+      context_text = " " + json.dumps(context, sort_keys=True)
+    except TypeError:
+      context_text = f" {context!r}"
+
+  log_message = "navrecorder client: " + message.strip() + context_text
+  if level == "error":
+    cloudlog.error(log_message)
+  elif level == "warning":
+    cloudlog.warning(log_message)
+  else:
+    cloudlog.info(log_message)
+  return {"ok": True}
+
+
 class NavRecorderHandler(SimpleHTTPRequestHandler):
   def __init__(self, *args: Any, **kwargs: Any) -> None:
     super().__init__(*args, directory=STATIC_DIR, **kwargs)
@@ -379,12 +413,22 @@ class NavRecorderHandler(SimpleHTTPRequestHandler):
     self.wfile.write(data)
 
   def do_GET(self) -> None:
-    if self.path == "/status":
-      self._send_json(_status())
-      return
-    if self.path == "/":
-      self.path = "/index.html"
-    super().do_GET()
+    try:
+      if self.path == "/status":
+        self._send_json(_status())
+        return
+      if self.path == "/maps_api_key":
+        self._send_json(_maps_api_key())
+        return
+      if self.path == "/":
+        self.path = "/index.html"
+      super().do_GET()
+    except RequestError as e:
+      cloudlog.warning("navrecorder: request failed path=%s status=%d error=%s", self.path, e.status, e.payload.get("error"))
+      self._send_json(e.payload, e.status)
+    except Exception as e:
+      cloudlog.exception("navrecorder request failed")
+      self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
   def do_POST(self) -> None:
     try:
@@ -395,6 +439,8 @@ class NavRecorderHandler(SimpleHTTPRequestHandler):
         self._send_json(_plan_route(body))
       elif self.path == "/clear_nav":
         self._send_json(_clear_pending_navigation())
+      elif self.path == "/client_log":
+        self._send_json(_client_log(body))
       else:
         raise RequestError(HTTPStatus.NOT_FOUND, {"error": "not found"})
     except RequestError as e:
