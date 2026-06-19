@@ -270,6 +270,10 @@
       let currentMarker = null;
       let routeLine = null;
       let markerInfoWindow = null;
+      let geocoder = null;
+      let hoverAddressTimer = null;
+      let hoverGeocodeRequestId = 0;
+      let addressCache = {};
       let previewTimer = null;
       let previewRequestId = 0;
       let lastPreviewKey = "";
@@ -391,6 +395,20 @@
         return position ? {lat: position.lat(), lng: position.lng()} : null;
       }
 
+      function pointLat(point) {
+        return typeof point?.lat === "function" ? point.lat() : point?.lat;
+      }
+
+      function pointLng(point) {
+        return typeof point?.lng === "function" ? point.lng() : point?.lng;
+      }
+
+      function normalizeLatLng(point) {
+        const lat = pointLat(point);
+        const lng = pointLng(point);
+        return Number.isFinite(lat) && Number.isFinite(lng) ? {lat, lng} : null;
+      }
+
       function markerIcon(kind) {
         const isOrigin = kind === "origin";
         return {
@@ -413,12 +431,80 @@
       }
 
       function describePoint(point) {
-        if (!point) {
+        const normalized = normalizeLatLng(point);
+        if (!normalized) {
           return "unknown";
         }
-        const lat = typeof point.lat === "function" ? point.lat() : point.lat;
-        const lng = typeof point.lng === "function" ? point.lng() : point.lng;
-        return Number.isFinite(lat) && Number.isFinite(lng) ? `${lat.toFixed(6)}, ${lng.toFixed(6)}` : "unknown";
+        return `${normalized.lat.toFixed(6)}, ${normalized.lng.toFixed(6)}`;
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, (ch) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        }[ch]));
+      }
+
+      function addressCacheKey(point) {
+        const normalized = normalizeLatLng(point);
+        return normalized ? `${normalized.lat.toFixed(5)},${normalized.lng.toFixed(5)}` : "";
+      }
+
+      function reverseGeocode(point, callback) {
+        const location = normalizeLatLng(point);
+        if (!location || !geocoder) {
+          callback(null);
+          return;
+        }
+        const key = addressCacheKey(location);
+        if (addressCache[key]) {
+          callback(addressCache[key]);
+          return;
+        }
+        geocoder.geocode({location}, (results, status) => {
+          if (status === "OK" && results?.[0]?.formatted_address) {
+            addressCache[key] = results[0].formatted_address;
+            callback(addressCache[key]);
+            return;
+          }
+          debug("Reverse geocode failed", {status, location}, "warning");
+          callback(null);
+        });
+      }
+
+      function scheduleAddressTooltip(point, title, anchor = null) {
+        window.clearTimeout(hoverAddressTimer);
+        const location = normalizeLatLng(point);
+        if (!location) {
+          return;
+        }
+        const requestId = ++hoverGeocodeRequestId;
+        hoverAddressTimer = window.setTimeout(() => {
+          reverseGeocode(location, (address) => {
+            if (requestId !== hoverGeocodeRequestId || !address) {
+              return;
+            }
+            const detail = `${escapeHtml(address)}<br><span>${escapeHtml(describePoint(location))}</span>`;
+            markerInfoWindow.setContent(`<strong>${escapeHtml(title)}</strong><br>${detail}`);
+            if (anchor) {
+              markerInfoWindow.open({map, anchor});
+            } else {
+              markerInfoWindow.setPosition(location);
+              markerInfoWindow.open({map});
+            }
+          });
+        }, 1600);
+      }
+
+      function clearAddressTooltip(closeWindow = true) {
+        window.clearTimeout(hoverAddressTimer);
+        hoverGeocodeRequestId += 1;
+        if (closeWindow) {
+          markerInfoWindow?.close();
+        }
       }
 
       function applyMarkerInfo(marker, title, detail) {
@@ -427,10 +513,11 @@
         if (!marker.navRecorderHoverReady) {
           marker.addListener("mouseover", () => {
             const info = marker.navRecorderInfo || {title, detail};
-            markerInfoWindow.setContent(`<strong>${info.title}</strong><br>${info.detail}`);
+            markerInfoWindow.setContent(`<strong>${escapeHtml(info.title)}</strong><br>${escapeHtml(info.detail)}<br><span>Hold for address</span>`);
             markerInfoWindow.open({map, anchor: marker});
+            scheduleAddressTooltip(markerPosition(marker), info.title, marker);
           });
-          marker.addListener("mouseout", () => markerInfoWindow.close());
+          marker.addListener("mouseout", () => clearAddressTooltip());
           marker.navRecorderHoverReady = true;
         }
       }
@@ -453,6 +540,7 @@
         marker.setPosition(position);
         marker.setIcon(markerIcon(kind));
         marker.setLabel(markerLabel(kind));
+        marker.setDraggable(kind !== "origin" || Boolean($("origin").value.trim()) || routeLine !== null);
         applyMarkerInfo(marker, kind === "origin" ? "Origin" : "Destination", describePoint(position));
       }
 
@@ -529,7 +617,14 @@
           fullscreenControl: true,
         });
         markerInfoWindow = new google.maps.InfoWindow();
+        geocoder = new google.maps.Geocoder();
+        map.addListener("mousemove", (event) => {
+          scheduleAddressTooltip(event.latLng, "Map location");
+        });
+        map.addListener("mouseout", () => clearAddressTooltip());
+        map.addListener("dragstart", () => clearAddressTooltip());
         map.addListener("click", (event) => {
+          clearAddressTooltip();
           if (destinationMarker) {
             destinationMarker.setPosition(event.latLng);
             updateEndpointMarker(destinationMarker, "destination", markerPosition(destinationMarker));
@@ -554,7 +649,22 @@
         if (!position) {
           return;
         }
+        updateEndpointMarker(destinationMarker, "destination", position);
         $("destination").value = `${position.lat.toFixed(6)},${position.lng.toFixed(6)}`;
+        schedulePreviewRoute();
+      }
+
+      function updateOriginField() {
+        if (!currentMarker) {
+          return;
+        }
+        const position = markerPosition(currentMarker);
+        if (!position) {
+          return;
+        }
+        updateEndpointMarker(currentMarker, "origin", position);
+        $("origin").value = `${position.lat.toFixed(6)},${position.lng.toFixed(6)}`;
+        debug("Origin moved on map", position);
         schedulePreviewRoute();
       }
 
@@ -599,8 +709,10 @@
           if (currentMarker) {
             updateEndpointMarker(currentMarker, "origin", originPoint);
           } else {
-            currentMarker = makeEndpointMarker("origin", originPoint);
+            currentMarker = makeEndpointMarker("origin", originPoint, true);
+            currentMarker.addListener("dragend", updateOriginField);
           }
+          currentMarker.setDraggable(true);
         }
         if (destinationPoint) {
           if (destinationMarker) {
@@ -710,13 +822,16 @@
         }
 
         const currentGps = toLatLng(status?.currentGps);
+        const originOverride = parseLatLngText($("origin").value);
+        const originPosition = originOverride || currentGps;
         if (!routeLine) {
           if (currentMarker) {
             currentMarker.setMap(null);
             currentMarker = null;
           }
-          if (currentGps) {
-            currentMarker = makeEndpointMarker("origin", currentGps);
+          if (originPosition) {
+            currentMarker = makeEndpointMarker("origin", originPosition, true);
+            currentMarker.addListener("dragend", updateOriginField);
           }
         }
 
