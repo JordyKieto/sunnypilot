@@ -22,11 +22,14 @@ public:
   inline int segment() const { return part; }
   inline const std::string& segmentPath() const { return segment_path; }
   inline const std::string& routeName() const { return route_name; }
+  inline bool isRouteSidecarWritten() const { return route_sidecar_written; }
+  inline void markRouteSidecarWritten() { route_sidecar_written = true; }
   inline void write(kj::ArrayPtr<kj::byte> bytes, bool in_qlog) { write(bytes.begin(), bytes.size(), in_qlog); }
   inline void setExitSignal(int signal) { exit_signal = signal; }
 
 protected:
   int part = -1, exit_signal = 0;
+  bool route_sidecar_written = false;
   std::string route_path, route_name, segment_path, lock_file;
   kj::Array<capnp::word> init_data;
   std::unique_ptr<ZstdFileWriter> rlog, qlog;

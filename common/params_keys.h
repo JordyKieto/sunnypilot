@@ -157,6 +157,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"EnableCopyparty", {PERSISTENT | BACKUP, BOOL}},
     {"EnableGithubRunner", {PERSISTENT | BACKUP, BOOL}},
     {"GreenLightAlert", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"GoogleMapsApiKey", {PERSISTENT | DONT_LOG | BACKUP, STRING}},
     {"GithubRunnerSufficientVoltage", {CLEAR_ON_MANAGER_START , BOOL}},
     {"HasAcceptedTermsSP", {PERSISTENT, STRING, "0"}},
     {"HideVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
@@ -256,6 +257,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"OsmWayTest", {PERSISTENT, STRING}},
     {"RoadName", {CLEAR_ON_ONROAD_TRANSITION, STRING}},
     {"RoadNameToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
+
+    // Planned navigation recording
+    {"PendingNavigationRecording", {CLEAR_ON_MANAGER_START | DONT_LOG, JSON}},
+    {"LastNavigationRecording", {PERSISTENT | DONT_LOG, JSON}},
 
     // Speed Limit
     {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "1"}},

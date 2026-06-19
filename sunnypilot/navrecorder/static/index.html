@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Navigation Recorder</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f6f7f9;
+        --fg: #15171a;
+        --muted: #5e6673;
+        --panel: #ffffff;
+        --border: #d7dce2;
+        --accent: #126e5c;
+        --accent-fg: #ffffff;
+        --danger: #a93434;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #101214;
+          --fg: #f2f4f5;
+          --muted: #a8b0ba;
+          --panel: #1a1d20;
+          --border: #333940;
+          --accent: #20a486;
+          --accent-fg: #07100d;
+          --danger: #ff8c8c;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        width: min(720px, 100%);
+        margin: 0 auto;
+        padding: 24px 16px 40px;
+      }
+      h1 {
+        margin: 0 0 4px;
+        font-size: 28px;
+        line-height: 1.1;
+        font-weight: 700;
+      }
+      .sub {
+        margin: 0 0 20px;
+        color: var(--muted);
+        font-size: 15px;
+      }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 14px;
+      }
+      label {
+        display: block;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 650;
+        margin: 0 0 6px;
+      }
+      input {
+        width: 100%;
+        min-height: 46px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--fg);
+        padding: 10px 12px;
+        font: inherit;
+      }
+      .field { margin-bottom: 14px; }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 40px;
+        color: var(--fg);
+        font-size: 14px;
+        font-weight: 500;
+      }
+      .check input {
+        width: 18px;
+        min-height: 18px;
+      }
+      button {
+        width: 100%;
+        min-height: 48px;
+        border: 0;
+        border-radius: 6px;
+        background: var(--accent);
+        color: var(--accent-fg);
+        font: inherit;
+        font-weight: 750;
+      }
+      button:disabled {
+        opacity: .55;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .error { color: var(--danger); }
+      .ok { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Navigation Recorder</h1>
+      <p class="sub">Enter a destination before driving. The route snapshot is saved once with the recording.</p>
+
+      <section>
+        <div class="field">
+          <label for="apiKey">Google Maps API key</label>
+          <input id="apiKey" name="apiKey" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="AIza...">
+        </div>
+        <button id="saveKey" type="button">Save API Key</button>
+      </section>
+
+      <section>
+        <div class="field">
+          <label for="destination">Destination</label>
+          <input id="destination" name="destination" autocomplete="street-address" placeholder="123 Main St, Los Angeles, CA">
+        </div>
+        <div class="field">
+          <label for="origin">Origin override</label>
+          <input id="origin" name="origin" autocomplete="street-address" placeholder="Leave blank to use device GPS">
+        </div>
+        <div class="row field">
+          <label class="check"><input id="avoidTolls" type="checkbox">Avoid tolls</label>
+          <label class="check"><input id="avoidHighways" type="checkbox">Avoid highways</label>
+          <label class="check"><input id="avoidFerries" type="checkbox">Avoid ferries</label>
+        </div>
+        <button id="start" type="button">Plan Route for Recording</button>
+      </section>
+
+      <section>
+        <pre id="status">Loading status...</pre>
+      </section>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const statusEl = $("status");
+      const buttons = [$("saveKey"), $("start")];
+
+      function setBusy(busy) {
+        buttons.forEach((button) => button.disabled = busy);
+      }
+
+      function show(value, ok = true) {
+        statusEl.className = ok ? "ok" : "error";
+        statusEl.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      }
+
+      async function request(path, options = {}) {
+        const response = await fetch(path, {
+          headers: {"Content-Type": "application/json"},
+          ...options,
+        });
+        const text = await response.text();
+        let body;
+        try {
+          body = text ? JSON.parse(text) : {};
+        } catch {
+          body = {raw: text};
+        }
+        if (!response.ok) {
+          throw body;
+        }
+        return body;
+      }
+
+      async function refresh() {
+        try {
+          const body = await request("/status");
+          show(body, true);
+        } catch (e) {
+          show(e, false);
+        }
+      }
+
+      $("saveKey").addEventListener("click", async () => {
+        setBusy(true);
+        try {
+          await request("/api_key", {method: "POST", body: JSON.stringify({apiKey: $("apiKey").value})});
+          await refresh();
+        } catch (e) {
+          show(e, false);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      $("start").addEventListener("click", async () => {
+        setBusy(true);
+        try {
+          const body = await request("/route", {
+            method: "POST",
+            body: JSON.stringify({
+              apiKey: $("apiKey").value,
+              origin: $("origin").value || null,
+              destination: $("destination").value,
+              avoid: {
+                tolls: $("avoidTolls").checked,
+                highways: $("avoidHighways").checked,
+                ferries: $("avoidFerries").checked,
+              },
+            }),
+          });
+          show(body, true);
+        } catch (e) {
+          show(e, false);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      refresh();
+    </script>
+  </body>
+</html>

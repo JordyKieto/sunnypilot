@@ -1,5 +1,6 @@
 #include <sys/xattr.h>
 
+#include <fstream>
 #include <map>
 #include <memory>
 #include <string>
@@ -27,6 +28,39 @@ void logger_rotate(LoggerdState *s) {
   s->ready_to_rotate = 0;
   s->last_rotate_tms = millis_since_boot();
   LOGW((s->logger.segment() == 0) ? "logging to %s" : "rotated to %s", s->logger.segmentPath().c_str());
+}
+
+void write_pending_navigation_sidecar(LoggerdState *s) {
+  Params params;
+  const std::string navigation = params.get("PendingNavigationRecording");
+  if (navigation.empty()) return;
+
+  if (s->logger.isRouteSidecarWritten()) {
+    LOGW("ignoring pending navigation sidecar for route %s because this recording already has navigation data", s->logger.routeName().c_str());
+    params.remove("PendingNavigationRecording");
+    return;
+  }
+
+  const std::string out_path = s->logger.segmentPath() + "/navigation.json";
+  LOGW("writing pending navigation sidecar for route %s segment %d to %s", s->logger.routeName().c_str(), s->logger.segment(), out_path.c_str());
+  std::ofstream out(out_path, std::ios::binary);
+  if (!out.good()) {
+    LOGE("failed to open navigation sidecar %s", out_path.c_str());
+    return;
+  }
+
+  out << navigation;
+  out.close();
+
+  if (!out.good()) {
+    LOGE("failed to write navigation sidecar %s", out_path.c_str());
+    return;
+  }
+
+  params.put("LastNavigationRecording", navigation);
+  params.remove("PendingNavigationRecording");
+  s->logger.markRouteSidecarWritten();
+  LOGW("wrote navigation sidecar to %s", out_path.c_str());
 }
 
 void rotate_if_needed(LoggerdState *s) {
@@ -256,6 +290,7 @@ void loggerd_thread() {
   // init logger
   logger_rotate(&s);
   Params().put("CurrentRoute", s.logger.routeName());
+  write_pending_navigation_sidecar(&s);
 
   std::map<std::string, EncoderInfo> encoder_infos_dict;
   std::vector<RemoteEncoder*> encoders_with_audio;
@@ -276,6 +311,8 @@ void loggerd_thread() {
   uint64_t msg_count = 0, bytes_count = 0;
   double start_ts = millis_since_boot();
   while (!do_exit) {
+    write_pending_navigation_sidecar(&s);
+
     // poll for new messages on all sockets
     for (auto sock : poller->poll(1000)) {
       if (do_exit) break;
@@ -314,6 +351,7 @@ void loggerd_thread() {
         }
 
         rotate_if_needed(&s);
+        write_pending_navigation_sidecar(&s);
 
         if ((++msg_count % 10000) == 0) {
           double seconds = (millis_since_boot() - start_ts) / 1000.0;

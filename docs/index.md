@@ -10,3 +10,7 @@ openpilot is designed to be used on the comma four.
 ## How does it work?
 
 In short, openpilot uses the car's existing APIs for the built-in [ADAS](https://en.wikipedia.org/wiki/Advanced_driver-assistance_system) system and simply provides better acceleration, braking, and steering inputs than the stock system.
+
+## Design docs
+
+* [Navigation Mode PRD](NAVIGATION_MODE_PRD.md)
