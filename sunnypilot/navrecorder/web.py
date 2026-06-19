@@ -277,6 +277,46 @@ def _maps_api_key() -> dict[str, Any]:
   return {"apiKey": api_key.strip()}
 
 
+def _preview_route(body: dict[str, Any]) -> dict[str, Any]:
+  params = Params()
+  api_key = body.get("apiKey") or params.get("GoogleMapsApiKey")
+  if not isinstance(api_key, str) or not api_key.strip():
+    cloudlog.warning("navrecorder: route preview rejected, missing Google Maps API key")
+    raise RequestError(HTTPStatus.BAD_REQUEST, {"error": "Google Maps API key is required"})
+  api_key = api_key.strip()
+
+  manual_origin = _waypoint(body.get("origin"))
+  origin = manual_origin or _current_origin(params)
+  destination = _waypoint(body.get("destination"))
+  if origin is None:
+    cloudlog.warning("navrecorder: route preview rejected, current GPS unavailable and no origin override provided")
+    raise RequestError(HTTPStatus.BAD_REQUEST, {"error": "origin is required because current GPS is unavailable"})
+  if destination is None:
+    cloudlog.warning("navrecorder: route preview rejected, missing destination")
+    raise RequestError(HTTPStatus.BAD_REQUEST, {"error": "destination is required"})
+
+  avoid = body.get("avoid") if isinstance(body.get("avoid"), dict) else {}
+  cloudlog.info("navrecorder: route preview started origin_source=%s destination_type=%s",
+                "manual" if manual_origin is not None else "gps",
+                "address" if "address" in destination else "gps")
+  routes_response = _compute_route(api_key, origin, destination, avoid)
+  routes = routes_response.get("routes") or []
+  if not routes:
+    cloudlog.warning("navrecorder: Google returned no preview routes")
+    raise RequestError(HTTPStatus.BAD_REQUEST, {"error": "Google returned no routes", "response": routes_response})
+
+  route = routes[0]
+  encoded_polyline = _route_polyline(route)
+  cloudlog.info("navrecorder: route preview succeeded distance_m=%s duration=%s has_polyline=%s",
+                route.get("distanceMeters"), route.get("duration"), bool(encoded_polyline))
+  return {
+    "ok": True,
+    "distanceMeters": route.get("distanceMeters"),
+    "duration": route.get("duration"),
+    "encodedPolyline": encoded_polyline,
+  }
+
+
 def _plan_route(body: dict[str, Any]) -> dict[str, Any]:
   params = Params()
   api_key = body.get("apiKey") or params.get("GoogleMapsApiKey")
@@ -435,6 +475,8 @@ class NavRecorderHandler(SimpleHTTPRequestHandler):
       body = self._read_json()
       if self.path == "/api_key":
         self._send_json(_save_api_key(body))
+      elif self.path == "/preview_route":
+        self._send_json(_preview_route(body))
       elif self.path == "/route":
         self._send_json(_plan_route(body))
       elif self.path == "/clear_nav":

@@ -62,6 +62,7 @@
       .map-shell {
         padding: 0;
         overflow: hidden;
+        position: relative;
       }
       .map-frame {
         width: 100%;
@@ -80,6 +81,49 @@
       }
       .map-meta span {
         white-space: nowrap;
+      }
+      .map-legend {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 2;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+        max-width: calc(100% - 20px);
+        padding: 8px 10px;
+        border: 1px solid rgba(0, 0, 0, .18);
+        border-radius: 6px;
+        background: rgba(255, 255, 255, .92);
+        color: #15171a;
+        font-size: 12px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, .12);
+      }
+      .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        white-space: nowrap;
+      }
+      .legend-dot {
+        display: inline-grid;
+        place-items: center;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        color: #ffffff;
+        font-size: 11px;
+        font-weight: 800;
+        line-height: 1;
+      }
+      .origin-dot { background: #1d4ed8; }
+      .destination-dot { background: #b91c1c; }
+      .route-dot {
+        width: 28px;
+        height: 4px;
+        border-radius: 999px;
+        background: #126e5c;
       }
       label {
         display: block;
@@ -160,6 +204,11 @@
       <p class="sub">Enter a destination before driving. The route snapshot is saved once with the recording.</p>
 
       <section class="map-shell">
+        <div class="map-legend" id="mapLegend" aria-label="Map legend">
+          <span class="legend-item"><span class="legend-dot origin-dot">O</span>Origin</span>
+          <span class="legend-item"><span class="legend-dot destination-dot">D</span>Destination</span>
+          <span class="legend-item"><span class="route-dot"></span>Route</span>
+        </div>
         <div id="routeMap" class="map-frame" aria-label="Planned route map"></div>
         <div class="map-meta" id="mapMeta">
           <span>Map not ready</span>
@@ -220,6 +269,10 @@
       let destinationMarker = null;
       let currentMarker = null;
       let routeLine = null;
+      let markerInfoWindow = null;
+      let previewTimer = null;
+      let previewRequestId = 0;
+      let lastPreviewKey = "";
       let mapReady = false;
       let googleMapsPromise = null;
       let googleMapsLoadedKey = "";
@@ -338,6 +391,71 @@
         return position ? {lat: position.lat(), lng: position.lng()} : null;
       }
 
+      function markerIcon(kind) {
+        const isOrigin = kind === "origin";
+        return {
+          path: google.maps.SymbolPath.CIRCLE,
+          scale: 12,
+          fillColor: isOrigin ? "#1d4ed8" : "#b91c1c",
+          fillOpacity: 1,
+          strokeColor: "#ffffff",
+          strokeWeight: 3,
+        };
+      }
+
+      function markerLabel(kind) {
+        return {
+          text: kind === "origin" ? "O" : "D",
+          color: "#ffffff",
+          fontSize: "12px",
+          fontWeight: "800",
+        };
+      }
+
+      function describePoint(point) {
+        if (!point) {
+          return "unknown";
+        }
+        const lat = typeof point.lat === "function" ? point.lat() : point.lat;
+        const lng = typeof point.lng === "function" ? point.lng() : point.lng;
+        return Number.isFinite(lat) && Number.isFinite(lng) ? `${lat.toFixed(6)}, ${lng.toFixed(6)}` : "unknown";
+      }
+
+      function applyMarkerInfo(marker, title, detail) {
+        marker.navRecorderInfo = {title, detail};
+        marker.setTitle(`${title}: ${detail}`);
+        if (!marker.navRecorderHoverReady) {
+          marker.addListener("mouseover", () => {
+            const info = marker.navRecorderInfo || {title, detail};
+            markerInfoWindow.setContent(`<strong>${info.title}</strong><br>${info.detail}`);
+            markerInfoWindow.open({map, anchor: marker});
+          });
+          marker.addListener("mouseout", () => markerInfoWindow.close());
+          marker.navRecorderHoverReady = true;
+        }
+      }
+
+      function makeEndpointMarker(kind, position, draggable = false) {
+        const title = kind === "origin" ? "Origin" : "Destination";
+        const marker = new google.maps.Marker({
+          position,
+          map,
+          draggable,
+          title: `${title}: ${describePoint(position)}`,
+          icon: markerIcon(kind),
+          label: markerLabel(kind),
+        });
+        applyMarkerInfo(marker, title, describePoint(position));
+        return marker;
+      }
+
+      function updateEndpointMarker(marker, kind, position) {
+        marker.setPosition(position);
+        marker.setIcon(markerIcon(kind));
+        marker.setLabel(markerLabel(kind));
+        applyMarkerInfo(marker, kind === "origin" ? "Origin" : "Destination", describePoint(position));
+      }
+
       window.__navRecorderGoogleMapsLoaded = () => {
         debug("Google Maps JavaScript API loaded");
         googleMapsResolve?.();
@@ -410,16 +528,13 @@
           streetViewControl: false,
           fullscreenControl: true,
         });
+        markerInfoWindow = new google.maps.InfoWindow();
         map.addListener("click", (event) => {
           if (destinationMarker) {
             destinationMarker.setPosition(event.latLng);
+            updateEndpointMarker(destinationMarker, "destination", markerPosition(destinationMarker));
           } else {
-            destinationMarker = new google.maps.Marker({
-              position: event.latLng,
-              map,
-              draggable: true,
-              title: "Destination",
-            });
+            destinationMarker = makeEndpointMarker("destination", event.latLng, true);
             destinationMarker.addListener("dragend", updateDestinationField);
           }
           updateDestinationField();
@@ -440,7 +555,7 @@
           return;
         }
         $("destination").value = `${position.lat.toFixed(6)},${position.lng.toFixed(6)}`;
-        updateMap(lastStatus);
+        schedulePreviewRoute();
       }
 
       function fitMap(points) {
@@ -459,6 +574,134 @@
         }
       }
 
+      function clearPreviewRoute() {
+        clearRouteOverlay();
+        lastPreviewKey = "";
+      }
+
+      function renderEncodedRoute(encodedPolyline, resetPreviewKey = true) {
+        clearRouteOverlay();
+        if (resetPreviewKey) {
+          lastPreviewKey = "";
+        }
+        const routePoints = decodePolyline(encodedPolyline);
+        routeLine = new google.maps.Polyline({
+          path: routePoints,
+          geodesic: true,
+          strokeColor: "#126e5c",
+          strokeOpacity: 0.9,
+          strokeWeight: 5,
+          map,
+        });
+        const originPoint = routePoints[0];
+        const destinationPoint = routePoints[routePoints.length - 1];
+        if (originPoint) {
+          if (currentMarker) {
+            updateEndpointMarker(currentMarker, "origin", originPoint);
+          } else {
+            currentMarker = makeEndpointMarker("origin", originPoint);
+          }
+        }
+        if (destinationPoint) {
+          if (destinationMarker) {
+            updateEndpointMarker(destinationMarker, "destination", destinationPoint);
+          } else {
+            destinationMarker = makeEndpointMarker("destination", destinationPoint, true);
+            destinationMarker.addListener("dragend", updateDestinationField);
+          }
+        }
+        fitMap(routeLine.getPath().getArray());
+      }
+
+      async function previewRoute() {
+        if (!map) {
+          return;
+        }
+
+        const origin = $("origin").value.trim() || null;
+        const destination = parseDestination($("destination").value);
+        if (!destination) {
+          clearPreviewRoute();
+          setMapMeta("Map ready. Click the map or enter a destination.");
+          return;
+        }
+        if (!origin && !lastStatus?.currentGps) {
+          debug("Route preview skipped: enter an origin override or wait for current GPS", null, "warning");
+          setMapMeta("Enter an origin override or wait for current GPS to preview the route.");
+          return;
+        }
+
+        const requestBody = {
+          apiKey: $("apiKey").value.trim() || null,
+          origin,
+          destination,
+          avoid: {
+            tolls: $("avoidTolls").checked,
+            highways: $("avoidHighways").checked,
+            ferries: $("avoidFerries").checked,
+          },
+        };
+        const previewKey = safeJson(requestBody);
+        if (previewKey === lastPreviewKey) {
+          return;
+        }
+        lastPreviewKey = previewKey;
+        const requestId = ++previewRequestId;
+        clearRouteOverlay();
+        debug("Requesting route preview", {
+          originType: origin ? "manual" : "currentGps",
+          destinationType: typeof destination === "string" ? "address" : "latLng",
+        });
+
+        try {
+          const body = await request("/preview_route", {
+            method: "POST",
+            body: JSON.stringify(requestBody),
+          });
+          if (requestId !== previewRequestId) {
+            return;
+          }
+          if (!body.encodedPolyline) {
+            clearPreviewRoute();
+            debug("Route preview failed: response missing polyline", body, "warning");
+            setMapMeta("Route preview failed: missing route polyline");
+            return;
+          }
+          renderEncodedRoute(body.encodedPolyline, false);
+          debug("Route preview rendered", {
+            distanceMeters: body.distanceMeters,
+            duration: body.duration,
+          });
+          updateMapMeta();
+        } catch (e) {
+          if (requestId !== previewRequestId) {
+            return;
+          }
+          clearPreviewRoute();
+          debug("Route preview failed", e, "warning");
+          setMapMeta(`Route preview failed: ${e?.error || "request failed"}`);
+        }
+      }
+
+      function schedulePreviewRoute() {
+        window.clearTimeout(previewTimer);
+        previewTimer = window.setTimeout(previewRoute, 450);
+      }
+
+      function updateMapMeta() {
+        const currentGps = toLatLng(lastStatus?.currentGps);
+        const destinationText = $("destination").value.trim() || "unset";
+        const originText = $("origin").value.trim() || "current GPS";
+        const routeLabel = lastStatus?.pendingRoute || lastStatus?.currentRoute || "route";
+        const gpsLabel = currentGps && lastStatus?.currentGps ? `current ${pointText(lastStatus.currentGps)}` : "current location unavailable";
+        mapMetaEl.innerHTML = `
+          <span>${routeLabel}</span>
+          <span>origin ${originText}</span>
+          <span>destination ${destinationText}</span>
+          <span>${gpsLabel}</span>
+        `;
+      }
+
       function updateMap(status) {
         ensureMap();
         if (!map) {
@@ -467,43 +710,30 @@
         }
 
         const currentGps = toLatLng(status?.currentGps);
-        if (currentMarker) {
-          currentMarker.setMap(null);
-          currentMarker = null;
-        }
-        if (currentGps) {
-          currentMarker = new google.maps.Marker({
-            position: currentGps,
-            map,
-            title: "Current GPS",
-          });
+        if (!routeLine) {
+          if (currentMarker) {
+            currentMarker.setMap(null);
+            currentMarker = null;
+          }
+          if (currentGps) {
+            currentMarker = makeEndpointMarker("origin", currentGps);
+          }
         }
 
         if (!destinationMarker) {
           const destination = waypointLatLng(status?.pendingDestinationWaypoint) || parseLatLngText(status?.pendingDestination);
           if (destination) {
-            destinationMarker = new google.maps.Marker({
-              position: destination,
-              map,
-              draggable: true,
-              title: "Destination",
-            });
+            destinationMarker = makeEndpointMarker("destination", destination, true);
             destinationMarker.addListener("dragend", updateDestinationField);
             $("destination").value = `${destination.lat.toFixed(6)},${destination.lng.toFixed(6)}`;
           }
         }
 
-        clearRouteOverlay();
         const encodedPolyline = status?.pendingEncodedPolyline;
         if (encodedPolyline) {
-          routeLine = new google.maps.Polyline({
-            path: decodePolyline(encodedPolyline),
-            geodesic: true,
-            strokeColor: "#126e5c",
-            strokeOpacity: 0.9,
-            strokeWeight: 5,
-            map,
-          });
+          renderEncodedRoute(encodedPolyline);
+        } else {
+          schedulePreviewRoute();
         }
 
         const layers = [];
@@ -527,16 +757,7 @@
           }
         }
 
-        const destinationText = $("destination").value.trim() || "unset";
-        const originText = $("origin").value.trim() || "current GPS";
-        const routeLabel = status?.pendingRoute || status?.currentRoute || "route";
-        const gpsLabel = currentGps ? `current ${pointText(status.currentGps)}` : "current location unavailable";
-        mapMetaEl.innerHTML = `
-          <span>${routeLabel}</span>
-          <span>origin ${originText}</span>
-          <span>destination ${destinationText}</span>
-          <span>${gpsLabel}</span>
-        `;
+        updateMapMeta();
       }
 
       async function request(path, options = {}) {
@@ -604,6 +825,10 @@
         try {
           const destination = parseDestination($("destination").value);
           const apiKey = $("apiKey").value.trim();
+          debug("Planning route for recording", {
+            destinationType: typeof destination === "string" ? "address" : destination ? "latLng" : "missing",
+            originOverride: Boolean($("origin").value.trim()),
+          });
           const body = await request("/route", {
             method: "POST",
             body: JSON.stringify({
@@ -617,6 +842,15 @@
               },
             }),
           });
+          debug("Route planned for recording", {
+            hasPolyline: Boolean(body.encodedPolyline),
+            distanceMeters: body.distanceMeters,
+            duration: body.duration,
+            stepCount: body.stepCount,
+          });
+          if (body.encodedPolyline && map) {
+            renderEncodedRoute(body.encodedPolyline);
+          }
           show(body, true);
           await refresh();
         } catch (e) {
@@ -633,6 +867,7 @@
           const body = await request("/clear_nav", {method: "POST", body: "{}"});
           show(body, true);
           clearRouteOverlay();
+          clearPreviewRoute();
           await refresh();
         } catch (e) {
           debug("Clear pending navigation failed", e, "error");
@@ -643,6 +878,11 @@
       });
 
       refresh();
+      $("destination").addEventListener("input", schedulePreviewRoute);
+      $("origin").addEventListener("input", schedulePreviewRoute);
+      ["avoidTolls", "avoidHighways", "avoidFerries"].forEach((id) => {
+        $(id).addEventListener("change", schedulePreviewRoute);
+      });
       setInterval(() => {
         if (lastStatus && (lastStatus.hasPendingNavigation || lastStatus.currentRoute || lastStatus.currentGps)) {
           refresh();
