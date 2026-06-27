@@ -15,11 +15,15 @@
           <h1>Chevy Bolt controls</h1>
           <p class="subhead">Runs the trained policy on IRL tensors and maps outputs to accelerator, brake, and steering.</p>
         </div>
-        <div class="actions">
-          <button id="start-btn" class="btn btn-success">Start inference</button>
-          <button id="stop-btn" class="btn btn-outline-light">Stop</button>
-          <button id="step-btn" class="btn btn-secondary">Step once</button>
-        </div>
+      <div class="actions">
+        <button id="start-btn" class="btn btn-success">Start inference</button>
+        <button id="stop-btn" class="btn btn-outline-light">Stop</button>
+        <button id="step-btn" class="btn btn-secondary">Step once</button>
+      </div>
+      <div class="upload-row">
+        <input id="model-input" type="file" accept=".onnx" />
+        <span>Upload local ONNX model</span>
+      </div>
       </div>
 
       <div class="grid">

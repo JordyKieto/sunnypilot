@@ -6,6 +6,12 @@ async function getJson(path, options = {}) {
   return await resp.json();
 }
 
+async function uploadModel(file) {
+  const form = new FormData();
+  form.append("model", file);
+  return await getJson("/model", { method: "POST", body: form });
+}
+
 function fmt(v) {
   if (v === null || v === undefined) return "-";
   if (typeof v === "number") return Number.isInteger(v) ? `${v}` : v.toFixed(4);
@@ -16,7 +22,7 @@ function render(status) {
   $("#status").text(status.message || (status.running ? "running" : "idle"));
   $("#sample-index").text(fmt(status.sample_index));
   $("#source").text(fmt(status.source));
-  $("#status").text(`${fmt(status.manual_infer_mode ? "manual" : status.message)}`);
+  $("#status").text(status.manual_infer_mode ? "manual" : (status.message || "idle"));
   const pred = status.prediction || {};
   const mapped = pred.chevy_bolt_controls || {};
   const policy = pred.policy_outputs || {};
@@ -46,6 +52,19 @@ $("#stop-btn").on("click", async () => {
 
 $("#step-btn").on("click", async () => {
   render(await getJson("/step", { method: "POST" }));
+});
+
+$("#model-input").on("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  $("#infer-log").text(`Uploading ${file.name}...`);
+  try {
+    const result = await uploadModel(file);
+    $("#infer-log").text(`Uploaded ${result.path} (${result.bytes} bytes)`);
+    await refresh();
+  } catch (err) {
+    $("#infer-log").text(String(err));
+  }
 });
 
 refresh();

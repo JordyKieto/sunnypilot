@@ -4,6 +4,7 @@ import logging
 import os
 import ssl
 import subprocess
+from pathlib import Path
 
 from aiohttp import web
 from aiohttp import ClientSession
@@ -18,9 +19,10 @@ logging.basicConfig(level=logging.INFO)
 
 TELEOPDIR = f"{BASEDIR}/tools/bodyteleop"
 WEBRTCD_HOST, WEBRTCD_PORT = "localhost", 5001
-DEFAULT_MODEL_PATH = os.path.join(BASEDIR, "sunnypilot", "models", "irl_policy_bolt_200.keras")
+DEFAULT_MODEL_PATH = os.path.join(BASEDIR, "sunnypilot", "models", "irl_policy_bolt_200.onnx")
 DEFAULT_DATASET_PATH = os.path.join(BASEDIR, "drift-datasets-irl", "preprocessed_dataset.npz")
 ENGINE = InferenceEngine(DEFAULT_MODEL_PATH, DEFAULT_DATASET_PATH)
+MODEL_UPLOAD_PATH = Path(DEFAULT_MODEL_PATH)
 
 
 ## SSL
@@ -79,6 +81,37 @@ async def infer_step(request: 'web.Request'):
   return web.json_response(ENGINE.step_once())
 
 
+async def upload_model(request: 'web.Request'):
+  reader = await request.multipart()
+  field = await reader.next()
+  if field is None or field.name != "model":
+    return web.json_response({"ok": False, "error": "missing model upload"}, status=400)
+
+  MODEL_UPLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+  tmp_path = MODEL_UPLOAD_PATH.with_suffix(".uploading")
+  size = 0
+  with open(tmp_path, "wb") as f:
+    while True:
+      chunk = await field.read_chunk()
+      if not chunk:
+        break
+      size += len(chunk)
+      f.write(chunk)
+  os.replace(tmp_path, MODEL_UPLOAD_PATH)
+  ENGINE.reload_model(str(MODEL_UPLOAD_PATH))
+  Params().put("ManualInferStatus", json.dumps({
+    "step": 0,
+    "message": "model uploaded and ready",
+    "payload": {"path": str(MODEL_UPLOAD_PATH), "bytes": size, "status": "ready"},
+  }))
+  return web.json_response({
+    "ok": True,
+    "path": str(MODEL_UPLOAD_PATH),
+    "bytes": size,
+    "message": "upload complete, model reloaded",
+  })
+
+
 async def offer(request: 'web.Request'):
   params = await request.json()
   body = StreamRequestBody(params["sdp"], ["driver"], ["testJoystick"], ["carState"])
@@ -106,6 +139,7 @@ def main():
   app.router.add_post("/start", infer_start)
   app.router.add_post("/stop", infer_stop)
   app.router.add_post("/step", infer_step)
+  app.router.add_post("/model", upload_model)
   app.router.add_post("/offer", offer)
   app.router.add_static('/static', os.path.join(TELEOPDIR, 'static'))
   web.run_app(app, access_log=None, host="0.0.0.0", port=5000, ssl_context=ssl_context)

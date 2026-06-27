@@ -1,14 +1,25 @@
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 import numpy as np
-import tensorflow as tf
 
 LOGGER = logging.getLogger("irl_infer")
+
+
+def _import_onnxruntime():
+    try:
+        import onnxruntime as ort
+        return ort
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "onnxruntime"])
+        import onnxruntime as ort
+        return ort
 
 
 class InferenceEngine:
@@ -30,13 +41,32 @@ class InferenceEngine:
         self._dataset = None
         self._cursor = 0
         self.model = None
+        self._backend = None
+        self._input_names = None
+
+    def reload_model(self, model_path: str | None = None):
+        if model_path is not None:
+            self.model_path = Path(model_path)
+        self.model = None
+        self._backend = None
+        self._input_names = None
+        return self._load_model()
 
     def _load_model(self):
         if self.model is not None:
             return self.model
         if not self.model_path.exists():
             raise FileNotFoundError(f"Missing model checkpoint: {self.model_path}")
-        self.model = tf.keras.models.load_model(self.model_path, compile=False)
+        if self.model_path.suffix.lower() == ".onnx":
+            ort = _import_onnxruntime()
+            self._backend = "onnxruntime"
+            self.model = ort.InferenceSession(str(self.model_path), providers=["CPUExecutionProvider"])
+            self._input_names = [i.name for i in self.model.get_inputs()]
+        else:
+            import tensorflow as tf
+
+            self._backend = "keras"
+            self.model = tf.keras.models.load_model(self.model_path, compile=False)
         return self.model
 
     def _load_dataset(self):
@@ -87,14 +117,23 @@ class InferenceEngine:
     def step_once(self):
         model = self._load_model()
         inputs, source = self._build_inputs(self._cursor)
-        prediction = model(inputs, training=False)
-        pedal_logits = prediction["pedal_state_logits"].numpy()[0]
+        if self._backend == "onnxruntime":
+            feed = {}
+            for name in self._input_names or []:
+                if name in inputs:
+                    feed[name] = inputs[name].astype(np.float32)
+            outputs = model.run(None, feed)
+            output_names = [o.name for o in model.get_outputs()]
+            prediction = {name: np.asarray(value) for name, value in zip(output_names, outputs)}
+        else:
+            prediction = model(inputs, training=False)
+        pedal_logits = np.asarray(prediction["pedal_state_logits"])[0]
         pedal_state = int(np.argmax(pedal_logits))
-        throttle = float(prediction["throttle_magnitude"].numpy()[0, 0])
-        brake = float(prediction["brake_magnitude"].numpy()[0, 0])
-        steering = float(prediction["steering"].numpy()[0, 0])
-        vego = float(prediction["vego"].numpy()[0, 0])
-        delta_v = float(prediction["delta_v"].numpy()[0, 0])
+        throttle = float(np.asarray(prediction["throttle_magnitude"])[0, 0])
+        brake = float(np.asarray(prediction["brake_magnitude"])[0, 0])
+        steering = float(np.asarray(prediction["steering"])[0, 0])
+        vego = float(np.asarray(prediction["vego"])[0, 0])
+        delta_v = float(np.asarray(prediction["delta_v"])[0, 0])
         mapped = {
             "chevy_bolt_controls": {
                 "accelerator_pedal": throttle if pedal_state == 1 else 0.0,
