@@ -137,6 +137,21 @@ class LiveSampler(threading.Thread):
       timestamp=time.time(),
     )
 
+  def _make_stub_sample(self) -> LiveSample:
+    now = time.time()
+    image_latent = np.zeros((1, 51, 128), dtype=np.float32)
+    telemetry = np.zeros((1, 51, 1), dtype=np.float32)
+    telemetry[0, :, 0] = 0.0
+    control_history = np.zeros((1, 51, 4), dtype=np.float32)
+    control_history[0, :, 3] = 0.0
+    return LiveSample(
+      image_latent=image_latent,
+      telemetry=telemetry,
+      control_history=control_history,
+      actual={"speed": 0.0, "throttle": 0.0, "brake": 0.0, "steering": 0.0, "source": "stub"},
+      timestamp=now,
+    )
+
   def run(self) -> None:
     self._init_streams()
     while not self._stop.is_set():
@@ -144,6 +159,8 @@ class LiveSampler(threading.Thread):
         if self._sm is not None:
           self._sm.update(0)
           self._update_latest(self._make_sample())
+        else:
+          self._update_latest(self._make_stub_sample())
       except Exception as e:  # pragma: no cover
         cloudlog.exception("shadowmode live sampler failed: %s", e)
       time.sleep(LIVE_REFRESH_S)
@@ -246,7 +263,9 @@ class TinygradOnnxSession:
           result = self.model(tuple(tensor_inputs))
           call_mode = "positional_tuple"
     except Exception as e:
-      raise RuntimeError(f"Tinygrad ONNX execution failed: {e}") from e
+      raise RuntimeError(
+        f"Tinygrad ONNX execution failed: {e} | model={self.model_type} | inputs={list(inputs.keys())}"
+      ) from e
 
     output_names = [item["name"] for item in self.outputs_meta] or [
       "pedal_state_logits", "throttle_magnitude", "brake_magnitude", "steering", "vego", "delta_v"
@@ -275,6 +294,7 @@ class TinygradOnnxSession:
       "outputs": list(outputs.keys()),
       "callMode": call_mode,
       "inputOrder": [item["name"] for item in self.inputs_meta],
+      "inputShapes": [list(v.shape) for v in ordered_inputs],
     }
 
 
