@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+MAX_URL_WAYPOINTS = 8
 
 
 def _encode_polyline(points: list[tuple[float, float]]) -> str:
@@ -59,6 +60,20 @@ def _as_point(value: Any, default: tuple[float, float]) -> dict[str, float]:
     if isinstance(value.get("lat"), (int, float)) and isinstance(value.get("lng"), (int, float)):
       return {"lat": float(value["lat"]), "lng": float(value["lng"])}
   return {"lat": default[0], "lng": default[1]}
+
+
+def _google_maps_route_url(origin: dict[str, float], destination: dict[str, float], points: list[tuple[float, float]]) -> str:
+  params = {
+    "api": "1",
+    "travelmode": "driving",
+    "dir_action": "navigate",
+    "origin": f"{origin['lat']:.6f},{origin['lng']:.6f}",
+    "destination": f"{destination['lat']:.6f},{destination['lng']:.6f}",
+  }
+  waypoint_texts = [f"{lat:.6f},{lng:.6f}" for lat, lng in points[1:-1][:MAX_URL_WAYPOINTS]]
+  if waypoint_texts:
+    params["waypoints"] = "|".join(waypoint_texts)
+  return "https://www.google.com/maps/dir/?%s" % urlencode(params, safe="|,")
 
 
 @dataclass
@@ -110,6 +125,7 @@ def _preview_route(body: dict[str, Any]) -> dict[str, Any]:
     "distanceMeters": 1800,
     "duration": "420s",
     "encodedPolyline": encoded,
+    "googleMapsUrl": _google_maps_route_url(origin, destination, points),
   }
 
 
@@ -131,6 +147,7 @@ def _plan_route(body: dict[str, Any]) -> dict[str, Any]:
     "origin": STATE.pending_origin,
     "destination": STATE.pending_destination,
     "encodedPolyline": encoded,
+    "googleMapsUrl": _google_maps_route_url(origin, destination, points),
     "message": "Mock route planned locally.",
   }
 

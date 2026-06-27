@@ -32,6 +32,7 @@ FIELD_MASK = ",".join([
   "routes.travelAdvisory.speedReadingIntervals",
 ])
 MAX_SPEED_LIMIT_POINTS = 100
+MAX_URL_WAYPOINTS = 8
 
 
 class RequestError(Exception):
@@ -84,6 +85,61 @@ def _waypoint(value: Any) -> dict[str, Any] | None:
   if isinstance(value, str) and value.strip():
     return {"address": value.strip()}
   return None
+
+
+def _map_url_location(value: dict[str, Any] | None) -> str | None:
+  if not isinstance(value, dict):
+    return None
+  place_id = value.get("placeId") or value.get("place_id")
+  if isinstance(place_id, str) and place_id.strip():
+    return place_id.strip()
+  lat_lng = value.get("location", {}).get("latLng") if isinstance(value.get("location"), dict) else None
+  if isinstance(lat_lng, dict):
+    lat = lat_lng.get("latitude")
+    lng = lat_lng.get("longitude")
+    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+      return f"{lat:.6f},{lng:.6f}"
+  if "latitude" in value and "longitude" in value:
+    lat = value.get("latitude")
+    lng = value.get("longitude")
+    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+      return f"{lat:.6f},{lng:.6f}"
+  return None
+
+
+def _google_maps_route_url(route_response: dict[str, Any], origin: dict[str, Any], destination: dict[str, Any], steps: list[dict[str, Any]]) -> str:
+  params: dict[str, Any] = {"api": "1", "travelmode": "driving", "dir_action": "navigate"}
+  origin_text = _map_url_location(origin)
+  destination_text = _map_url_location(destination)
+  if origin_text:
+    params["origin"] = origin_text
+  if destination_text:
+    params["destination"] = destination_text
+
+  origin_place_id = origin.get("placeId") or origin.get("place_id") if isinstance(origin, dict) else None
+  destination_place_id = destination.get("placeId") or destination.get("place_id") if isinstance(destination, dict) else None
+  if isinstance(origin_place_id, str) and origin_place_id.strip():
+    params["origin_place_id"] = origin_place_id.strip()
+  if isinstance(destination_place_id, str) and destination_place_id.strip():
+    params["destination_place_id"] = destination_place_id.strip()
+
+  waypoint_texts: list[str] = []
+  waypoint_place_ids: list[str] = []
+  for step in steps[:MAX_URL_WAYPOINTS]:
+    start = step.get("startLocation")
+    text = _map_url_location(start if isinstance(start, dict) else None)
+    if text:
+      waypoint_texts.append(text)
+    place_id = start.get("placeId") or start.get("place_id") if isinstance(start, dict) else None
+    if isinstance(place_id, str) and place_id.strip():
+      waypoint_place_ids.append(place_id.strip())
+
+  if waypoint_texts:
+    params["waypoints"] = "|".join(waypoint_texts)
+  if waypoint_place_ids and len(waypoint_place_ids) == len(waypoint_texts):
+    params["waypoint_place_ids"] = "|".join(waypoint_place_ids)
+
+  return "https://www.google.com/maps/dir/?%s" % urlencode(params, safe="|,")
 
 
 def _decode_polyline(encoded: str) -> list[tuple[float, float]]:
@@ -314,6 +370,7 @@ def _preview_route(body: dict[str, Any]) -> dict[str, Any]:
     "distanceMeters": route.get("distanceMeters"),
     "duration": route.get("duration"),
     "encodedPolyline": encoded_polyline,
+    "googleMapsUrl": _google_maps_route_url(routes_response, origin, destination, _summarize_steps(route)),
   }
 
 
@@ -389,6 +446,7 @@ def _plan_route(body: dict[str, Any]) -> dict[str, Any]:
     "origin": snapshot["origin"],
     "destination": snapshot["destination"],
     "encodedPolyline": snapshot["summary"]["encodedPolyline"],
+    "googleMapsUrl": _google_maps_route_url(routes_response, origin, destination, snapshot["summary"]["steps"]),
     "message": "Navigation data will be written once to navigation.json for the current or next recording route.",
   }
 

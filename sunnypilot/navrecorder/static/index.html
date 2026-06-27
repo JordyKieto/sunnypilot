@@ -250,6 +250,9 @@
           <button id="start" type="button">Plan Route for Recording</button>
           <button id="clearNav" type="button">Clear Pending Nav</button>
         </div>
+        <div class="mini-row" style="margin-top: 10px;">
+          <button id="openMaps" type="button" disabled>Open in Google Maps</button>
+        </div>
       </section>
 
       <section>
@@ -268,7 +271,7 @@
       const debugLogEl = $("debugLog");
       const routeMapEl = $("routeMap");
       const mapMetaEl = $("mapMeta");
-      const buttons = [$("saveKey"), $("start"), $("clearNav")];
+      const buttons = [$("saveKey"), $("start"), $("clearNav"), $("openMaps")];
       const STATUS_REFRESH_MS = 10000;
       const LIVE_ROUTE_REFRESH_MS = 60000;
       const DEFAULT_CENTER = {lat: 37.7749, lng: -122.4194};
@@ -291,6 +294,7 @@
       let lastPreviewBaseKey = "";
       let lastLiveRoutePreviewAt = 0;
       let navFollowPausedUntil = 0;
+      let googleMapsUrl = "";
       let mapReady = false;
       let googleMapsPromise = null;
       let googleMapsLoadedKey = "";
@@ -327,12 +331,23 @@
       }
 
       function setBusy(busy) {
-        buttons.forEach((button) => button.disabled = busy);
+        buttons.forEach((button) => {
+          if (button.id === "openMaps") {
+            button.disabled = busy || !googleMapsUrl;
+            return;
+          }
+          button.disabled = busy;
+        });
       }
 
       function show(value, ok = true) {
         statusEl.className = ok ? "ok" : "error";
         statusEl.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      }
+
+      function updateMapsButton(url = "") {
+        googleMapsUrl = url || "";
+        $("openMaps").disabled = !googleMapsUrl;
       }
 
       function decodePolyline(encoded) {
@@ -920,6 +935,7 @@
             setMapMeta("Route preview failed: missing route polyline");
             return;
           }
+          updateMapsButton(body.googleMapsUrl || "");
           renderEncodedRoute(body.encodedPolyline, false);
           if (usingLiveOrigin) {
             lastLiveRoutePreviewAt = Date.now();
@@ -1114,6 +1130,7 @@
           if (body.encodedPolyline && map) {
             renderEncodedRoute(body.encodedPolyline);
           }
+          updateMapsButton(body.googleMapsUrl || "");
           show(body, true);
           await refresh();
         } catch (e) {
@@ -1129,6 +1146,7 @@
         try {
           const body = await request("/clear_nav", {method: "POST", body: "{}"});
           show(body, true);
+          updateMapsButton("");
           clearRouteOverlay();
           clearPreviewRoute();
           await refresh();
@@ -1141,6 +1159,7 @@
       });
 
       refresh();
+      updateMapsButton("");
       $("destination").addEventListener("input", schedulePreviewRoute);
       $("origin").addEventListener("input", schedulePreviewRoute);
       ["avoidTolls", "avoidHighways", "avoidFerries"].forEach((id) => {
@@ -1162,6 +1181,13 @@
       });
       window.addEventListener("unhandledrejection", (event) => {
         debug("Unhandled promise rejection", event.reason, "error");
+      });
+
+      $("openMaps").addEventListener("click", () => {
+        if (!googleMapsUrl) {
+          return;
+        }
+        window.open(googleMapsUrl, "_blank", "noopener,noreferrer");
       });
     </script>
   </body>
