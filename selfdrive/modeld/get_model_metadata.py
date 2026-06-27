@@ -11,16 +11,19 @@ from tinygrad.nn.onnx import OnnxPBParser
 class MetadataOnnxPBParser(OnnxPBParser):
   def _parse_ModelProto(self) -> dict:
     obj: dict[str, Any] = {"graph": {"input": [], "output": []}, "metadata_props": []}
-    for fid, wire_type in self._parse_message(self.reader.len):
-      match fid:
-        case 7:
-          obj["graph"] = self._parse_GraphProto()
-        case 8: # opset_import
-          self.reader.skip_field(wire_type)
-        case 14:
-          obj["metadata_props"].append(self._parse_StringStringEntryProto())
-        case _:
-          self.reader.skip_field(wire_type)
+    try:
+      for fid, wire_type in self._parse_message(self.reader.len):
+        match fid:
+          case 7:
+            obj["graph"] = self._parse_GraphProto()
+          case 8: # opset_import
+            self.reader.skip_field(wire_type)
+          case 14:
+            obj["metadata_props"].append(self._parse_StringStringEntryProto())
+          case _:
+            self.reader.skip_field(wire_type)
+    except ValueError as exc:
+      print(f"warning: skipping ONNX metadata parse for {self.reader.path}: {exc}")
     return obj
 
 

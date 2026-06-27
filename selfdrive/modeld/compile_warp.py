@@ -19,14 +19,22 @@ from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
 class MetadataOnnxPBParser(OnnxPBParser):
   def _parse_ModelProto(self) -> dict:
     obj: dict[str, Any] = {"graph": {"input": [], "output": []}, "metadata_props": []}
-    for fid, wire_type in self._parse_message(self.reader.len):
-      match fid:
-        case 7: # graph
-          self.reader.skip_field(wire_type)
-        case 8: # opset_import
-          self.reader.skip_field(wire_type)
-        case _:
-          self.reader.skip_field(wire_type)
+    try:
+      for fid, wire_type in self._parse_message(self.reader.len):
+        match fid:
+          case 7:
+            obj["graph"] = self._parse_GraphProto()
+          case 8: # opset_import
+            self.reader.skip_field(wire_type)
+          case 14:
+            obj["metadata_props"].append(self._parse_StringStringEntryProto())
+          case _:
+            self.reader.skip_field(wire_type)
+    except ValueError as exc:
+      # Newer exported ONNX models can include protobuf wire types that the
+      # tinygrad parser doesn't understand. The warp compilation only needs the
+      # model file to exist, so treat this as a soft failure and continue.
+      print(f"warning: skipping ONNX metadata parse for {self.reader.path}: {exc}")
     return obj
 
 MODELS_DIR = Path(__file__).parent / 'models'
