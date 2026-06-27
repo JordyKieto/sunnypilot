@@ -76,9 +76,9 @@ class LiveSampler(threading.Thread):
   def __init__(self) -> None:
     super().__init__(name="shadowmode-live-sampler")
     self._lock = threading.Lock()
-    self._latest = LiveSample()
     self._stop = threading.Event()
     self._sm = None
+    self._latest = self._make_stub_sample()
 
   def current(self) -> LiveSample:
     with self._lock:
@@ -202,7 +202,14 @@ class TinygradOnnxSession:
 
   def _read_meta(self, kind: str) -> list[dict[str, Any]]:
     meta: list[dict[str, Any]] = []
-    if hasattr(self.model, "captured"):
+    if kind == "inputs" and hasattr(self.model, "graph_inputs"):
+      for name, spec in self.model.graph_inputs.items():
+        shape = [None if isinstance(d, str) else int(d) for d in getattr(spec, "shape", [])]
+        meta.append({"name": name, "shape": shape})
+    elif kind == "outputs" and hasattr(self.model, "graph_outputs"):
+      for name in self.model.graph_outputs:
+        meta.append({"name": name, "shape": []})
+    elif hasattr(self.model, "captured"):
       expected = getattr(self.model.captured, "expected_names", [])
       info = getattr(self.model.captured, "expected_input_info", [])
       if kind == "inputs":
@@ -211,13 +218,13 @@ class TinygradOnnxSession:
           if idx < len(info):
             shape = [int(d) if isinstance(d, int) and d > 0 else -1 for d in info[idx][1]] if len(info[idx]) > 1 else []
           meta.append({"name": name, "shape": shape})
-    elif kind == "inputs":
+    if not meta and kind == "inputs":
       meta.extend([
         {"name": "image_latent", "shape": [None, 51, 128]},
         {"name": "telemetry", "shape": [None, 51, 1]},
         {"name": "control_history", "shape": [None, 51, 4]},
       ])
-    elif kind == "outputs":
+    elif not meta and kind == "outputs":
       meta.extend([
         {"name": "pedal_state_logits", "shape": [None, 3]},
         {"name": "throttle_magnitude", "shape": [None, 1]},
@@ -228,12 +235,38 @@ class TinygradOnnxSession:
       ])
     return meta
 
+  @staticmethod
+  def _to_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "contiguous"):
+      value = value.contiguous().realize()
+    if hasattr(value, "numpy"):
+      return np.asarray(value.numpy())
+    if hasattr(value, "uop") and hasattr(value.uop, "base") and hasattr(value.uop.base, "buffer"):
+      return np.asarray(value.uop.base.buffer.numpy())
+    return np.asarray(value)
+
+  def _normalize_outputs(self, result: Any, output_names: list[str]) -> dict[str, np.ndarray]:
+    if isinstance(result, dict):
+      arrays = {name: self._to_numpy(value) for name, value in result.items()}
+      expected = ["pedal_state_logits", "throttle_magnitude", "brake_magnitude", "steering", "vego", "delta_v"]
+      if not any(name in arrays for name in expected) and len(arrays) == len(expected):
+        return {expected[i]: value for i, value in enumerate(arrays.values())}
+      return arrays
+
+    if isinstance(result, (list, tuple)):
+      arrays = [self._to_numpy(value) for value in result]
+      return {output_names[i] if i < len(output_names) else f"output_{i}": arr for i, arr in enumerate(arrays)}
+
+    arr = self._to_numpy(result)
+    if arr.ndim >= 2 and arr.shape[-1] == len(output_names):
+      return {name: arr[..., i] for i, name in enumerate(output_names)}
+    return {"raw": arr}
+
   def run(self, sample: LiveSample) -> dict[str, Any]:
     if not hasattr(self.model, "__call__"):
       raise RuntimeError("Tinygrad ONNX session is not callable")
 
     inputs = {}
-    ordered_inputs = []
     for item in self.inputs_meta:
       name = item["name"]
       if name == "image_latent":
@@ -248,20 +281,10 @@ class TinygradOnnxSession:
         value = np.zeros(shape, dtype=np.float32)
       value = value.astype(np.float32)
       inputs[name] = value
-      ordered_inputs.append(value)
 
     try:
-      tensor_inputs = [Tensor(v, device="NPY").realize() for v in ordered_inputs]
-      try:
-        result = self.model(*tensor_inputs)
-        call_mode = "positional_star"
-      except TypeError:
-        try:
-          result = self.model(tensor_inputs)
-          call_mode = "positional_list"
-        except TypeError:
-          result = self.model(tuple(tensor_inputs))
-          call_mode = "positional_tuple"
+      result = self.model(inputs)
+      call_mode = "dict"
     except Exception as e:
       raise RuntimeError(
         f"Tinygrad ONNX execution failed: {e} | model={self.model_type} | inputs={list(inputs.keys())}"
@@ -271,20 +294,7 @@ class TinygradOnnxSession:
       "pedal_state_logits", "throttle_magnitude", "brake_magnitude", "steering", "vego", "delta_v"
     ]
 
-    if hasattr(result, "contiguous"):
-      result = result.contiguous().realize().numpy()
-    elif isinstance(result, (list, tuple)):
-      result = [np.asarray(x) for x in result]
-    else:
-      result = np.asarray(result)
-
-    if isinstance(result, np.ndarray):
-      if result.ndim >= 2 and result.shape[-1] == len(output_names):
-        outputs = {name: result[..., i] for i, name in enumerate(output_names)}
-      else:
-        outputs = {"raw": result}
-    else:
-      outputs = {output_names[i] if i < len(output_names) else f"output_{i}": arr for i, arr in enumerate(result)}
+    outputs = self._normalize_outputs(result, output_names)
 
     return {
       "ok": True,
@@ -294,7 +304,7 @@ class TinygradOnnxSession:
       "outputs": list(outputs.keys()),
       "callMode": call_mode,
       "inputOrder": [item["name"] for item in self.inputs_meta],
-      "inputShapes": [list(v.shape) for v in ordered_inputs],
+      "inputShapes": [list(v.shape) for v in inputs.values()],
     }
 
 
