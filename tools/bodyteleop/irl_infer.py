@@ -6,8 +6,11 @@ import sys
 import threading
 import time
 from pathlib import Path
+import cereal.messaging as messaging
 
 import numpy as np
+
+from openpilot.common.params import Params
 
 LOGGER = logging.getLogger("irl_infer")
 
@@ -30,6 +33,7 @@ class InferenceEngine:
         self._running = False
         self._thread = None
         self._stop = threading.Event()
+        self.pm = messaging.PubMaster(['carControl'])
         self._status = {
             "running": False,
             "message": "idle",
@@ -167,7 +171,16 @@ class InferenceEngine:
     def _loop(self):
         while not self._stop.is_set():
             try:
-                self.step_once()
+                result = self.step_once()
+                if not Params().get_bool("ManualInferShadowMode"):
+                    controls = result.get("chevy_bolt_controls", {})
+                    if controls:
+                        CC = messaging.new_message('carControl')
+                        CC.carControl.actuators.accel = controls.get("accelerator_pedal", 0.0)
+                        CC.carControl.actuators.steer = controls.get("steering_wheel", 0.0)
+                        CC.carControl.actuators.gas = controls.get("accelerator_pedal", 0.0)
+                        CC.carControl.actuators.brake = controls.get("brake_pedal", 0.0)
+                        self.pm.send('carControl', CC)
             except Exception as exc:
                 with self._lock:
                     self._status.update({"message": f"error: {exc}", "running": False})
@@ -190,6 +203,13 @@ class InferenceEngine:
     def stop(self):
         self._stop.set()
         self._running = False
+        # Send a neutral carControl message on stop
+        CC = messaging.new_message('carControl')
+        CC.carControl.actuators.accel = 0.0
+        CC.carControl.actuators.steer = 0.0
+        CC.carControl.actuators.gas = 0.0
+        CC.carControl.actuators.brake = 0.0
+        self.pm.send('carControl', CC)
         with self._lock:
             self._status["running"] = False
             self._status["message"] = "stopped"

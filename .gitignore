@@ -104,4 +104,5 @@ irl_transition.py
 irl_vae.py
 policy_epoch_0050.keras
 policy_epoch_0200.keras
+sunnypilot/models/irl_policy_bolt_200.onnx
 scripts/upload_irl_dataset_to_s3.py

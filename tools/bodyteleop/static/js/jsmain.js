@@ -12,6 +12,11 @@ async function uploadModel(file) {
   return await getJson("/model", { method: "POST", body: form });
 }
 
+function shadowModeEnabled() {
+  const el = document.getElementById("shadow-mode");
+  return el ? el.checked : true;
+}
+
 function fmt(v) {
   if (v === null || v === undefined) return "-";
   if (typeof v === "number") return Number.isInteger(v) ? `${v}` : v.toFixed(4);
@@ -20,6 +25,9 @@ function fmt(v) {
 
 function render(status) {
   $("#status").text(status.message || (status.running ? "running" : "idle"));
+  if (status.manual_infer_shadow_mode !== undefined) {
+    $("#infer-log").text(status.manual_infer_shadow_mode ? "shadow mode enabled" : "shadow mode disabled");
+  }
   $("#sample-index").text(fmt(status.sample_index));
   $("#source").text(fmt(status.source));
   $("#status").text(status.manual_infer_mode ? "manual" : (status.message || "idle"));
@@ -43,10 +51,16 @@ async function refresh() {
 }
 
 $("#start-btn").on("click", async () => {
-  render(await getJson("/start", { method: "POST" }));
+  $("#infer-log").text(shadowModeEnabled() ? "Starting in shadow mode..." : "Starting inference...");
+  render(await getJson("/start", {
+    method: "POST",
+    body: JSON.stringify({ shadow: shadowModeEnabled() }),
+    headers: { 'Content-Type': 'application/json' }
+  }));
 });
 
 $("#stop-btn").on("click", async () => {
+  $("#infer-log").text("Stopping...");
   render(await getJson("/stop", { method: "POST" }));
 });
 
@@ -60,7 +74,7 @@ $("#model-input").on("change", async (e) => {
   $("#infer-log").text(`Uploading ${file.name}...`);
   try {
     const result = await uploadModel(file);
-    $("#infer-log").text(`Uploaded ${result.path} (${result.bytes} bytes)`);
+    $("#infer-log").text(`Uploaded ${result.path} (${result.bytes} bytes). Model reloaded and ready.`);
     await refresh();
   } catch (err) {
     $("#infer-log").text(String(err));

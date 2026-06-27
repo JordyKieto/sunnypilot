@@ -58,6 +58,7 @@ def main():
 
   params = Params()
   params.put_bool("ManualInferMode", True)
+  params.put_bool("ManualInferShadowMode", True)
 
   model = ModelState()
   bundle = get_active_bundle(params)
@@ -177,6 +178,7 @@ def main():
         "model_execution_time": float(model_execution_time),
         "live_calib_seen": bool(live_calib_seen),
         "prepare_only": bool(prepare_only),
+        "shadow_mode": bool(params.get_bool("ManualInferShadowMode")),
       }
 
       if model_output is not None:
@@ -205,6 +207,8 @@ def main():
           "desiredAcceleration": float(action.desiredAcceleration),
           "shouldStop": bool(action.shouldStop),
         }
+        if params.get_bool("ManualInferShadowMode"):
+          payload["shadow_note"] = "no controls applied"
 
         modelv2_send = messaging.new_message("modelV2")
         drivingdata_send = messaging.new_message("drivingModelData")
@@ -237,6 +241,7 @@ def main():
 
   _log_payload(last_vipc_frame_id, "stopped", {})
   params.put_bool("ManualInferMode", False)
+  params.put_bool("ManualInferShadowMode", False)
 
 
 if __name__ == "__main__":

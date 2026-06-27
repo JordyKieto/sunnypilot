@@ -5,6 +5,7 @@ import os
 import ssl
 import subprocess
 from pathlib import Path
+import cereal.messaging as messaging
 
 from aiohttp import web
 from aiohttp import ClientSession
@@ -22,6 +23,7 @@ WEBRTCD_HOST, WEBRTCD_PORT = "localhost", 5001
 DEFAULT_MODEL_PATH = os.path.join(BASEDIR, "sunnypilot", "models", "irl_policy_bolt_200.onnx")
 DEFAULT_DATASET_PATH = os.path.join(BASEDIR, "drift-datasets-irl", "preprocessed_dataset.npz")
 ENGINE = InferenceEngine(DEFAULT_MODEL_PATH, DEFAULT_DATASET_PATH)
+PM = messaging.PubMaster(['carControl'])
 MODEL_UPLOAD_PATH = Path(DEFAULT_MODEL_PATH)
 
 
@@ -63,22 +65,44 @@ async def ping(request: 'web.Request'):
 async def infer_status(request: 'web.Request'):
   status = ENGINE.status()
   status["manual_infer_mode"] = Params().get_bool("ManualInferMode")
+  status["manual_infer_shadow_mode"] = Params().get_bool("ManualInferShadowMode")
   status["log"] = Params().get("ManualInferStatus") or ""
   return web.json_response(status)
 
 
 async def infer_start(request: 'web.Request'):
+  data = await request.json()
+  shadow_mode = data.get('shadow', True)
   Params().put_bool("ManualInferMode", True)
+  Params().put_bool("ManualInferShadowMode", shadow_mode)
   return web.json_response(ENGINE.start())
 
 
 async def infer_stop(request: 'web.Request'):
   Params().put_bool("ManualInferMode", False)
+  Params().put_bool("ManualInferShadowMode", False)
+  # Send a neutral carControl message on stop
+  CC = messaging.new_message('carControl')
+  CC.carControl.actuators.accel = 0.0
+  CC.carControl.actuators.steer = 0.0
+  CC.carControl.actuators.gas = 0.0
+  CC.carControl.actuators.brake = 0.0
+  PM.send('carControl', CC)
   return web.json_response(ENGINE.stop())
 
 
 async def infer_step(request: 'web.Request'):
-  return web.json_response(ENGINE.step_once())
+  result = ENGINE.step_once()
+  if not Params().get_bool("ManualInferShadowMode"):
+    controls = result.get("chevy_bolt_controls", {})
+    if controls:
+      CC = messaging.new_message('carControl')
+      CC.carControl.actuators.accel = controls.get("accelerator_pedal", 0.0)
+      CC.carControl.actuators.steer = controls.get("steering_wheel", 0.0)
+      CC.carControl.actuators.gas = controls.get("accelerator_pedal", 0.0)
+      CC.carControl.actuators.brake = controls.get("brake_pedal", 0.0)
+      PM.send('carControl', CC)
+  return web.json_response(result)
 
 
 async def upload_model(request: 'web.Request'):
