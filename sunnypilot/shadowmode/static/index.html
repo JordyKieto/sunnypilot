@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Shadow Mode</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; background: #f5f6f8; color: #14161a; }
+      main { max-width: 980px; margin: 0 auto; padding: 24px 16px 40px; }
+      section { background: white; border: 1px solid #d8dde3; border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+      h1 { margin: 0 0 8px; font-size: 28px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; }
+      .card { flex: 1 1 280px; background: #fbfcfd; border: 1px solid #e2e7ee; border-radius: 10px; padding: 14px; }
+      .label { color: #66707a; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+      .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+      input[type=file], textarea, button { width: 100%; font: inherit; }
+      textarea { min-height: 120px; }
+      button { min-height: 44px; border: 0; border-radius: 8px; background: #126e5c; color: white; font-weight: 700; }
+      pre { margin: 0; white-space: pre-wrap; }
+      .muted { color: #66707a; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Shadow Mode</h1>
+      <p class="muted">Upload ONNX on the device. The backend runs inference. This page only displays decoded outputs and actuals.</p>
+
+      <section>
+        <input id="model" type="file" accept=".onnx">
+        <button id="upload">Upload Model</button>
+      </section>
+
+      <section>
+        <div class="row">
+          <div class="card">
+            <div class="label">Actual</div>
+            <div class="value" id="actual">-</div>
+          </div>
+          <div class="card">
+            <div class="label">Predicted</div>
+            <div class="value" id="predicted">-</div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="label">Status</div>
+        <pre id="status">Waiting for model upload...</pre>
+      </section>
+
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      async function request(path, options = {}) {
+        const res = await fetch(path, {headers: {"Content-Type": "application/json"}, ...options});
+        const text = await res.text();
+        const body = text ? JSON.parse(text) : {};
+        if (!res.ok) throw body;
+        return body;
+      }
+      function render(body) {
+        $("status").textContent = JSON.stringify(body, null, 2);
+        $("actual").textContent = body.actual ? `throttle ${body.actual.throttle ?? 0}, brake ${body.actual.brake ?? 0}, steering ${body.actual.steering ?? 0}` : "-";
+        $("predicted").textContent = body.predicted ? `${body.predicted.pedal_state?.name || "-"} | throttle ${body.predicted.throttle ?? 0}, brake ${body.predicted.brake ?? 0}, steering ${body.predicted.steering ?? 0}` : "-";
+      }
+      $("upload").addEventListener("click", async () => {
+        const file = $("model").files[0];
+        if (!file) return;
+        const buf = await file.arrayBuffer();
+        const res = await fetch("/shadow/upload", {method: "POST", body: buf});
+        render(await res.json());
+      });
+      async function refresh() {
+        try {
+          render(await request("/shadow/status"));
+        } catch (e) {
+          $("status").textContent = JSON.stringify(e, null, 2);
+        }
+      }
+      setInterval(refresh, 1000);
+      refresh();
+    </script>
+  </body>
+  </html>
