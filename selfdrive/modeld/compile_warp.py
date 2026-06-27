@@ -7,27 +7,10 @@ from tinygrad.tensor import Tensor
 from tinygrad.helpers import Context
 from tinygrad.device import Device
 from tinygrad.engine.jit import TinyJit
-from typing import Any
-
-from tinygrad.nn.onnx import OnnxPBParser
 
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import MEDMODEL_INPUT_SIZE, DM_INPUT_SIZE
 from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
-
-
-class MetadataOnnxPBParser(OnnxPBParser):
-  def _parse_ModelProto(self) -> dict:
-    obj: dict[str, Any] = {"graph": {"input": [], "output": []}, "metadata_props": []}
-    for fid, wire_type in self._parse_message(self.reader.len):
-      match fid:
-        case 7: # graph
-          self.reader.skip_field(wire_type)
-        case 8: # opset_import
-          self.reader.skip_field(wire_type)
-        case _:
-          self.reader.skip_field(wire_type)
-    return obj
 
 MODELS_DIR = Path(__file__).parent / 'models'
 
@@ -142,11 +125,6 @@ def make_warp_dm(cam_w, cam_h, dm_w, dm_h):
 
 
 def compile_modeld_warp(cam_w, cam_h):
-  vision_model_path = MODELS_DIR / 'driving_vision.onnx'
-  if not vision_model_path.exists():
-    return
-  MetadataOnnxPBParser(vision_model_path).parse()
-
   model_w, model_h = MEDMODEL_INPUT_SIZE
   _, _, _, yuv_size = get_nv12_info(cam_w, cam_h)
 
@@ -187,10 +165,6 @@ def compile_modeld_warp(cam_w, cam_h):
 
 
 def compile_dm_warp(cam_w, cam_h):
-  dm_model_path = MODELS_DIR / 'dmonitoring_model.onnx'
-  if not dm_model_path.exists():
-    return
-  MetadataOnnxPBParser(dm_model_path).parse()
   dm_w, dm_h = DM_INPUT_SIZE
   _, _, _, yuv_size = get_nv12_info(cam_w, cam_h)
 
