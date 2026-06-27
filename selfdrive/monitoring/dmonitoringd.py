@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import cereal.messaging as messaging
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_DMON
 from openpilot.common.realtime import config_realtime_process
 from openpilot.selfdrive.monitoring.helpers import DriverMonitoring
 
@@ -13,7 +14,7 @@ def dmonitoringd_thread():
   sm = messaging.SubMaster(['driverStateV2', 'liveCalibration', 'carState', 'selfdriveState', 'modelV2',
                             'carControl'], poll='driverStateV2')
 
-  DM = DriverMonitoring(rhd_saved=params.get_bool("IsRhdDetected"), always_on=params.get_bool("AlwaysOnDM"))
+  DM = DriverMonitoring(rhd_saved=params.get_bool("IsRhdDetected"))
   demo_mode=False
 
   # 20Hz <- dmonitoringmodeld

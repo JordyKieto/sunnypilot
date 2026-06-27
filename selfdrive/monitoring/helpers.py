@@ -413,7 +413,7 @@ class DriverMonitoring:
       "faceDetected": self.face_detected,
       "isDistracted": self.driver_distracted,
       "distractedType": sum(self.distracted_types),
-      "awarenessStatus": self.awareness,
+      "awarenessStatus": int(self.awareness),
       "posePitchOffset": self.pose.pitch_offseter.filtered_stat.mean(),
       "posePitchValidCount": self.pose.pitch_offseter.filtered_stat.n,
       "poseYawOffset": self.pose.yaw_offseter.filtered_stat.mean(),
