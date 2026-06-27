@@ -174,7 +174,7 @@ procs += [
   # Models
   PythonProcess("models_manager", "sunnypilot.models.manager", only_offroad),
   NativeProcess("modeld_tinygrad", "sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model, not_manual_infer)),
-  PythonProcess("manual_inferd", "tools.bodyteleop.manual_inferd", and_(only_onroad, lambda started, params, CP: params.get_bool("ManualInferMode")), restart_if_crash=True),
+  PythonProcess("manual_inferd", "tools.manual_infer.manual_inferd", and_(only_onroad, lambda started, params, CP: params.get_bool("ManualInferMode")), restart_if_crash=True),
 
   # Backup
   PythonProcess("backup_manager", "sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
