@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
@@ -417,7 +417,9 @@ class ShadowHandler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
-  server = ThreadingHTTPServer(("0.0.0.0", 5051), ShadowHandler)
+  # Tinygrad's ONNX runner can keep SQLite state that is tied to the thread that
+  # created it, so handle upload and inference requests on the same server thread.
+  server = HTTPServer(("0.0.0.0", 5051), ShadowHandler)
   cloudlog.info("shadowmode listening on 0.0.0.0:5051")
   server.serve_forever()
 
