@@ -215,6 +215,7 @@ class TinygradOnnxSession:
       raise RuntimeError("Tinygrad ONNX session is not callable")
 
     inputs = {}
+    ordered_inputs = []
     for item in self.inputs_meta:
       name = item["name"]
       if name == "image_latent":
@@ -227,16 +228,16 @@ class TinygradOnnxSession:
         shape = item.get("shape") or [1]
         shape = [1 if (not isinstance(d, int) or d < 1) else d for d in shape]
         value = np.zeros(shape, dtype=np.float32)
-      inputs[name] = value.astype(np.float32)
+      value = value.astype(np.float32)
+      inputs[name] = value
+      ordered_inputs.append(value)
 
     try:
-      if hasattr(self.model, "inputs"):
-        for k, v in inputs.items():
-          self.model.inputs[k] = Tensor(v, device="NPY").realize()
-        result = self.model(**self.model.inputs) if callable(self.model) else self.model
-      else:
-        tensor_inputs = {k: Tensor(v, device="NPY").realize() for k, v in inputs.items()}
-        result = self.model(**tensor_inputs)
+      tensor_inputs = [Tensor(v, device="NPY").realize() for v in ordered_inputs]
+      try:
+        result = self.model(*tensor_inputs)
+      except TypeError:
+        result = self.model(tensor_inputs)
     except Exception as e:
       raise RuntimeError(f"Tinygrad ONNX execution failed: {e}") from e
 
@@ -264,6 +265,7 @@ class TinygradOnnxSession:
       "actual": sample.actual,
       "predicted": _decode_controls(outputs),
       "outputs": list(outputs.keys()),
+      "callMode": "positional",
     }
 
 
