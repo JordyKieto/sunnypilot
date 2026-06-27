@@ -290,6 +290,7 @@
       let lastPreviewKey = "";
       let lastPreviewBaseKey = "";
       let lastLiveRoutePreviewAt = 0;
+      let navFollowPausedUntil = 0;
       let mapReady = false;
       let googleMapsPromise = null;
       let googleMapsLoadedKey = "";
@@ -431,7 +432,7 @@
         if (kind === "live") {
           return {
             path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
-            scale: 5,
+            scale: 6,
             rotation: Number.isFinite(heading) ? heading : 0,
             fillColor: "#1d4ed8",
             fillOpacity: 1,
@@ -652,9 +653,14 @@
         map = new google.maps.Map(routeMapEl, {
           center: currentGps || DEFAULT_CENTER,
           zoom: currentGps ? 16 : 11,
+          heading: headingDeg(lastStatus?.currentGps) || 0,
+          tilt: 0,
           mapTypeControl: false,
           streetViewControl: false,
           fullscreenControl: true,
+          rotateControl: true,
+          gestureHandling: "greedy",
+          clickableIcons: false,
         });
         markerInfoWindow = new google.maps.InfoWindow();
         geocoder = new google.maps.Geocoder();
@@ -662,7 +668,13 @@
           scheduleAddressTooltip(event.latLng, "Map location");
         });
         map.addListener("mouseout", () => clearAddressTooltip());
-        map.addListener("dragstart", () => clearAddressTooltip());
+        map.addListener("dragstart", () => {
+          clearAddressTooltip();
+          navFollowPausedUntil = Date.now() + 12000;
+        });
+        map.addListener("zoom_changed", () => {
+          navFollowPausedUntil = Date.now() + 12000;
+        });
         map.addListener("click", (event) => {
           clearAddressTooltip();
           if (destinationMarker) {
@@ -712,6 +724,27 @@
         return toLatLng(lastStatus?.currentGps);
       }
 
+      function inNavMode() {
+        return Boolean(routeLine || lastStatus?.hasPendingNavigation || lastStatus?.currentRoute || $("destination").value.trim());
+      }
+
+      function shouldFollowLive() {
+        return inNavMode() && Date.now() >= navFollowPausedUntil;
+      }
+
+      function updateNavCamera(position = currentLivePosition()) {
+        if (!map || !position || !shouldFollowLive()) {
+          return;
+        }
+        const heading = headingDeg(lastStatus?.currentGps);
+        map.setOptions({
+          center: position,
+          zoom: Math.max(map.getZoom() || 0, 18),
+          heading: Number.isFinite(heading) ? heading : 0,
+          tilt: 0,
+        });
+      }
+
       function updateLiveMarker(position = currentLivePosition()) {
         if (!position || !map) {
           return;
@@ -722,6 +755,7 @@
         } else {
           currentMarker = makeEndpointMarker("live", position, false, heading);
         }
+        updateNavCamera(position);
       }
 
       function updateManualOriginMarker(position) {
@@ -740,7 +774,7 @@
       }
 
       function fitMap(points) {
-        if (!map || !points.length) {
+        if (!map || !points.length || inNavMode()) {
           return;
         }
         const bounds = new google.maps.LatLngBounds();
@@ -775,6 +809,7 @@
           lastPreviewKey = "";
         }
         const routePoints = decodePolyline(encodedPolyline);
+        const navActive = inNavMode();
         routeLine = new google.maps.Polyline({
           path: routePoints,
           geodesic: true,
@@ -805,7 +840,9 @@
             destinationMarker.addListener("dragend", updateDestinationField);
           }
         }
-        fitMap(routeLine.getPath().getArray());
+        if (!navActive) {
+          fitMap(routeLine.getPath().getArray());
+        }
       }
 
       async function previewRoute() {
@@ -915,7 +952,11 @@
         const heading = headingDeg(lastStatus?.currentGps);
         const headingText = heading === null ? "" : ` heading ${Math.round(heading)}deg`;
         const gpsLabel = currentGps && lastStatus?.currentGps ? `live ${pointText(lastStatus.currentGps)}${headingText}` : "live location unavailable";
+        const navLabel = inNavMode()
+          ? `navigation follow ${shouldFollowLive() ? "on" : "paused"}`
+          : "route preview";
         mapMetaEl.innerHTML = `
+          <span>${navLabel}</span>
           <span>${routeLabel}</span>
           <span>origin ${originText}</span>
           <span>destination ${destinationText}</span>
@@ -974,6 +1015,9 @@
           } else {
             fitMap(layers);
           }
+        }
+        if (currentGps && inNavMode()) {
+          updateNavCamera(currentGps);
         }
 
         updateMapMeta();
