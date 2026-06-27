@@ -155,6 +155,7 @@ class TinygradOnnxSession:
       raise RuntimeError("tinygrad is not available on this system")
     self.onnx_path = Path(onnx_path)
     self.model = self._load_model(self.onnx_path)
+    self.model_type = type(self.model).__name__
     self.inputs_meta = self._read_meta("inputs")
     self.outputs_meta = self._read_meta("outputs")
     self.ready = True
@@ -236,8 +237,14 @@ class TinygradOnnxSession:
       tensor_inputs = [Tensor(v, device="NPY").realize() for v in ordered_inputs]
       try:
         result = self.model(*tensor_inputs)
+        call_mode = "positional_star"
       except TypeError:
-        result = self.model(tensor_inputs)
+        try:
+          result = self.model(tensor_inputs)
+          call_mode = "positional_list"
+        except TypeError:
+          result = self.model(tuple(tensor_inputs))
+          call_mode = "positional_tuple"
     except Exception as e:
       raise RuntimeError(f"Tinygrad ONNX execution failed: {e}") from e
 
@@ -262,10 +269,12 @@ class TinygradOnnxSession:
 
     return {
       "ok": True,
+      "modelType": self.model_type,
       "actual": sample.actual,
       "predicted": _decode_controls(outputs),
       "outputs": list(outputs.keys()),
-      "callMode": "positional",
+      "callMode": call_mode,
+      "inputOrder": [item["name"] for item in self.inputs_meta],
     }
 
 
@@ -305,6 +314,7 @@ def _status() -> dict[str, Any]:
     "modelReady": bool(SESSION is not None and getattr(SESSION, "ready", False)),
     "running": bool(SESSION is not None and result is not None and not inference_error),
     "modelPath": str(MODEL_PATH),
+    "modelType": SESSION.model_type if SESSION else None,
     "liveTimestamp": current.timestamp,
     "inputs": SESSION.inputs_meta if SESSION else [],
     "outputs": SESSION.outputs_meta if SESSION else [],
