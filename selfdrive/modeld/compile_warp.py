@@ -21,6 +21,8 @@ class MetadataOnnxPBParser(OnnxPBParser):
     obj: dict[str, Any] = {"graph": {"input": [], "output": []}, "metadata_props": []}
     for fid, wire_type in self._parse_message(self.reader.len):
       match fid:
+        case 7: # graph
+          self.reader.skip_field(wire_type)
         case 8: # opset_import
           self.reader.skip_field(wire_type)
         case _:
