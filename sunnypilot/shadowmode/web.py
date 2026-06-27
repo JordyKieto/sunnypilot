@@ -17,6 +17,7 @@ from openpilot.common.swaglog import cloudlog
 STATIC_DIR = Path(BASEDIR) / "sunnypilot" / "shadowmode" / "static"
 MODEL_PATH = Path(tempfile.gettempdir()) / "shadowmode_model.onnx"
 LIVE_REFRESH_S = 0.2
+UI_REFRESH_S = 1.0
 
 try:
   import tinygrad.nn.onnx as tinygrad_onnx
@@ -62,9 +63,9 @@ def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
 
 @dataclass
 class LiveSample:
-  image_latent: np.ndarray = field(default_factory=lambda: np.zeros((1, 1, 1), dtype=np.float32))
-  telemetry: np.ndarray = field(default_factory=lambda: np.zeros((1, 1, 1), dtype=np.float32))
-  control_history: np.ndarray = field(default_factory=lambda: np.zeros((1, 1, 1), dtype=np.float32))
+  image_latent: np.ndarray = field(default_factory=lambda: np.zeros((1, 51, 128), dtype=np.float32))
+  telemetry: np.ndarray = field(default_factory=lambda: np.zeros((1, 51, 1), dtype=np.float32))
+  control_history: np.ndarray = field(default_factory=lambda: np.zeros((1, 51, 4), dtype=np.float32))
   actual: dict[str, Any] = field(default_factory=dict)
   timestamp: float = 0.0
 
@@ -98,27 +99,51 @@ class LiveSampler(threading.Thread):
     self._vipc_stream = VisionStreamType.VISION_STREAM_ROAD if hasattr(VisionStreamType, "VISION_STREAM_ROAD") else None
     self._vipc_client = None
 
+  @staticmethod
+  def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+      return float(value)
+    except Exception:
+      return default
+
+  def _make_sample(self) -> LiveSample:
+    car_state = self._sm["carState"] if self._sm is not None and "carState" in self._sm else None
+    car_control = self._sm["carControl"] if self._sm is not None and "carControl" in self._sm else None
+    speed = self._to_float(getattr(car_state, "vEgo", 0.0) if car_state is not None else 0.0)
+    gas = self._to_float(getattr(car_state, "gas", 0.0) if car_state is not None else 0.0)
+    brake = self._to_float(getattr(car_state, "brake", 0.0) if car_state is not None else 0.0)
+    steer = self._to_float(getattr(car_control, "steer", 0.0) if car_control is not None else 0.0)
+
+    image_latent = np.zeros((1, 51, 128), dtype=np.float32)
+    telemetry = np.zeros((1, 51, 1), dtype=np.float32)
+    telemetry[0, :, 0] = speed
+    control_history = np.zeros((1, 51, 4), dtype=np.float32)
+    control_history[0, :, 0] = gas
+    control_history[0, :, 1] = brake
+    control_history[0, :, 2] = steer
+    control_history[0, :, 3] = speed
+
+    return LiveSample(
+      image_latent=image_latent,
+      telemetry=telemetry,
+      control_history=control_history,
+      actual={
+        "speed": speed,
+        "throttle": gas,
+        "brake": brake,
+        "steering": steer,
+        "source": "device" if self._sm is not None else "stub",
+      },
+      timestamp=time.time(),
+    )
+
   def run(self) -> None:
     self._init_streams()
     while not self._stop.is_set():
       try:
         if self._sm is not None:
           self._sm.update(0)
-          car_state = self._sm["carState"] if "carState" in self._sm else None
-          car_control = self._sm["carControl"] if "carControl" in self._sm else None
-          sample = LiveSample(
-            image_latent=np.zeros((1, 1, 1), dtype=np.float32),
-            telemetry=np.zeros((1, 1, 1), dtype=np.float32),
-            control_history=np.zeros((1, 1, 1), dtype=np.float32),
-            actual={
-              "throttle": float(getattr(car_state, "gas", 0.0) or 0.0) if car_state is not None else 0.0,
-              "brake": float(getattr(car_state, "brake", 0.0) or 0.0) if car_state is not None else 0.0,
-              "steering": float(getattr(car_control, "steer", 0.0) or 0.0) if car_control is not None else 0.0,
-              "source": "device",
-            },
-            timestamp=time.time(),
-          )
-          self._update_latest(sample)
+          self._update_latest(self._make_sample())
       except Exception as e:  # pragma: no cover
         cloudlog.exception("shadowmode live sampler failed: %s", e)
       time.sleep(LIVE_REFRESH_S)
@@ -132,6 +157,7 @@ class TinygradOnnxSession:
     self.model = self._load_model(self.onnx_path)
     self.inputs_meta = self._read_meta("inputs")
     self.outputs_meta = self._read_meta("outputs")
+    self.ready = True
 
   def _load_model(self, onnx_path: Path) -> Any:
     candidates = [
@@ -167,6 +193,21 @@ class TinygradOnnxSession:
           if idx < len(info):
             shape = [int(d) if isinstance(d, int) and d > 0 else -1 for d in info[idx][1]] if len(info[idx]) > 1 else []
           meta.append({"name": name, "shape": shape})
+    elif kind == "inputs":
+      meta.extend([
+        {"name": "image_latent", "shape": [None, 51, 128]},
+        {"name": "telemetry", "shape": [None, 51, 1]},
+        {"name": "control_history", "shape": [None, 51, 4]},
+      ])
+    elif kind == "outputs":
+      meta.extend([
+        {"name": "pedal_state_logits", "shape": [None, 3]},
+        {"name": "throttle_magnitude", "shape": [None, 1]},
+        {"name": "brake_magnitude", "shape": [None, 1]},
+        {"name": "steering", "shape": [None, 1]},
+        {"name": "vego", "shape": [None, 1]},
+        {"name": "delta_v", "shape": [None, 1]},
+      ])
     return meta
 
   def run(self, sample: LiveSample) -> dict[str, Any]:
@@ -199,6 +240,10 @@ class TinygradOnnxSession:
     except Exception as e:
       raise RuntimeError(f"Tinygrad ONNX execution failed: {e}") from e
 
+    output_names = [item["name"] for item in self.outputs_meta] or [
+      "pedal_state_logits", "throttle_magnitude", "brake_magnitude", "steering", "vego", "delta_v"
+    ]
+
     if hasattr(result, "contiguous"):
       result = result.contiguous().realize().numpy()
     elif isinstance(result, (list, tuple)):
@@ -207,18 +252,23 @@ class TinygradOnnxSession:
       result = np.asarray(result)
 
     if isinstance(result, np.ndarray):
-      outputs = {"raw": result}
+      if result.ndim >= 2 and result.shape[-1] == len(output_names):
+        outputs = {name: result[..., i] for i, name in enumerate(output_names)}
+      else:
+        outputs = {"raw": result}
     else:
-      outputs = {f"output_{i}": arr for i, arr in enumerate(result)}
+      outputs = {output_names[i] if i < len(output_names) else f"output_{i}": arr for i, arr in enumerate(result)}
 
     return {
       "ok": True,
       "actual": sample.actual,
       "predicted": _decode_controls(outputs),
+      "outputs": list(outputs.keys()),
     }
 
 
 SESSION: TinygradOnnxSession | None = None
+SESSION_ERROR: str | None = None
 LIVE_SAMPLER = LiveSampler()
 LIVE_SAMPLER.start()
 
@@ -228,22 +278,40 @@ def _read_upload(body: bytes) -> None:
 
 
 def _load_uploaded_model() -> None:
-  global SESSION
-  SESSION = TinygradOnnxSession(MODEL_PATH)
+  global SESSION, SESSION_ERROR
+  try:
+    SESSION = TinygradOnnxSession(MODEL_PATH)
+    SESSION_ERROR = None
+  except Exception as e:
+    SESSION = None
+    SESSION_ERROR = str(e)
+    raise
 
 
 def _status() -> dict[str, Any]:
   current = LIVE_SAMPLER.current()
-  result = SESSION.run(current) if SESSION is not None else None
+  result = None
+  inference_error = None
+  if SESSION is not None:
+    try:
+      result = SESSION.run(current)
+    except Exception as e:
+      inference_error = str(e)
   return {
     "ok": True,
     "hasModel": SESSION is not None,
+    "modelReady": bool(SESSION is not None and getattr(SESSION, "ready", False)),
+    "running": bool(SESSION is not None and result is not None and not inference_error),
     "modelPath": str(MODEL_PATH),
     "liveTimestamp": current.timestamp,
     "inputs": SESSION.inputs_meta if SESSION else [],
     "outputs": SESSION.outputs_meta if SESSION else [],
+    "lastSample": current.actual,
     "actual": current.actual if current else {},
     "predicted": result["predicted"] if result else {},
+    "sessionError": SESSION_ERROR,
+    "inferenceError": inference_error,
+    "message": "model uploaded" if SESSION is not None else "waiting for model upload",
   }
 
 
@@ -282,9 +350,26 @@ class ShadowHandler(SimpleHTTPRequestHandler):
   def do_POST(self) -> None:
     if self.path == "/shadow/upload":
       length = int(self.headers.get("Content-Length", "0"))
-      _read_upload(self.rfile.read(length))
-      _load_uploaded_model()
-      self._send_json(_status())
+      body = self.rfile.read(length)
+      _read_upload(body)
+      try:
+        _load_uploaded_model()
+      except Exception as e:
+        cloudlog.exception("shadowmode model load failed: %s", e)
+        self._send_json({
+          "ok": False,
+          "error": str(e),
+          "modelPath": str(MODEL_PATH),
+          "status": _status(),
+        }, HTTPStatus.BAD_REQUEST)
+        return
+      self._send_json({
+        "ok": True,
+        "message": "model uploaded and loaded",
+        "bytes": len(body),
+        "modelPath": str(MODEL_PATH),
+        "status": _status(),
+      })
       return
     self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 

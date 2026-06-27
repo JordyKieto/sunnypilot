@@ -13,6 +13,9 @@
       .card { flex: 1 1 280px; background: #fbfcfd; border: 1px solid #e2e7ee; border-radius: 10px; padding: 14px; }
       .label { color: #66707a; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
       .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+      .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #e8edf3; color: #2b3641; font-size: 12px; font-weight: 700; }
+      .ok { background: #d8f3e3; color: #126e5c; }
+      .bad { background: #fee3e3; color: #9f1c1c; }
       input[type=file], textarea, button { width: 100%; font: inherit; }
       textarea { min-height: 120px; }
       button { min-height: 44px; border: 0; border-radius: 8px; background: #126e5c; color: white; font-weight: 700; }
@@ -24,6 +27,7 @@
     <main>
       <h1>Shadow Mode</h1>
       <p class="muted">Upload ONNX on the device. The backend runs inference. This page only displays decoded outputs and actuals.</p>
+      <p><span id="conn" class="pill">connecting...</span> <span id="runstate" class="pill">idle</span> <span id="fresh" class="pill">no sample yet</span></p>
 
       <section>
         <input id="model" type="file" accept=".onnx">
@@ -61,25 +65,45 @@
       }
       function render(body) {
         $("status").textContent = JSON.stringify(body, null, 2);
-        $("actual").textContent = body.actual ? `throttle ${body.actual.throttle ?? 0}, brake ${body.actual.brake ?? 0}, steering ${body.actual.steering ?? 0}` : "-";
+        $("conn").textContent = body.hasModel ? "model loaded" : "waiting for upload";
+        $("conn").className = body.hasModel ? "pill ok" : "pill bad";
+        $("runstate").textContent = body.inferenceError ? "inference error" : (body.running ? "inference running" : "idle");
+        $("runstate").className = body.inferenceError ? "pill bad" : (body.running ? "pill ok" : "pill");
+        const age = body.liveTimestamp ? Math.max(0, (Date.now() / 1000) - body.liveTimestamp).toFixed(1) : null;
+        $("fresh").textContent = age == null ? "no sample yet" : `sample age ${age}s`;
+        $("fresh").className = age != null && age < 2 ? "pill ok" : "pill bad";
+        $("actual").textContent = body.actual ? `speed ${body.actual.speed ?? 0}, throttle ${body.actual.throttle ?? 0}, brake ${body.actual.brake ?? 0}, steering ${body.actual.steering ?? 0}` : "-";
         $("predicted").textContent = body.predicted ? `${body.predicted.pedal_state?.name || "-"} | throttle ${body.predicted.throttle ?? 0}, brake ${body.predicted.brake ?? 0}, steering ${body.predicted.steering ?? 0}` : "-";
       }
       $("upload").addEventListener("click", async () => {
         const file = $("model").files[0];
         if (!file) return;
         const buf = await file.arrayBuffer();
-        const res = await fetch("/shadow/upload", {method: "POST", body: buf});
-        render(await res.json());
+        $("status").textContent = "Uploading model...";
+        try {
+          const res = await fetch("/shadow/upload", {method: "POST", body: buf});
+          const body = await res.json();
+          render(body.status || body);
+          if (!res.ok) throw body;
+        } catch (e) {
+          $("status").textContent = JSON.stringify(e, null, 2);
+          $("runstate").textContent = "upload failed";
+          $("runstate").className = "pill bad";
+        }
       });
       async function refresh() {
         try {
           render(await request("/shadow/status"));
         } catch (e) {
           $("status").textContent = JSON.stringify(e, null, 2);
+          $("conn").textContent = "backend unavailable";
+          $("conn").className = "pill bad";
+          $("runstate").textContent = "offline";
+          $("runstate").className = "pill bad";
         }
       }
       setInterval(refresh, 1000);
       refresh();
     </script>
   </body>
-  </html>
+</html>
