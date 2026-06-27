@@ -1,4 +1,7 @@
 body { margin: 0; background: #0b1220; color: #e5e7eb; font-family: system-ui, sans-serif; }
 #main { max-width: 900px; margin: 24px auto; padding: 24px; }
 .actions { display: flex; gap: 12px; margin: 16px 0; }
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 12px; }
+.metrics div { background: #111827; padding: 12px; border-radius: 10px; }
+span { display: block; color: #94a3b8; font-size: 12px; text-transform: uppercase; }
 pre { background: #111827; padding: 16px; border-radius: 12px; min-height: 240px; }
