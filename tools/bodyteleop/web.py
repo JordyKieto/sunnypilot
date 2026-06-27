@@ -11,12 +11,16 @@ from aiohttp import ClientSession
 from openpilot.common.basedir import BASEDIR
 from openpilot.system.webrtc.webrtcd import StreamRequestBody
 from openpilot.common.params import Params
+from tools.bodyteleop.irl_infer import InferenceEngine
 
 logger = logging.getLogger("bodyteleop")
 logging.basicConfig(level=logging.INFO)
 
 TELEOPDIR = f"{BASEDIR}/tools/bodyteleop"
 WEBRTCD_HOST, WEBRTCD_PORT = "localhost", 5001
+DEFAULT_MODEL_PATH = os.path.join(BASEDIR, "sunnypilot", "models", "irl_policy_bolt_200.keras")
+DEFAULT_DATASET_PATH = os.path.join(BASEDIR, "drift-datasets-irl", "preprocessed_dataset.npz")
+ENGINE = InferenceEngine(DEFAULT_MODEL_PATH, DEFAULT_DATASET_PATH)
 
 
 ## SSL
@@ -54,6 +58,27 @@ async def ping(request: 'web.Request'):
   return web.Response(text="pong")
 
 
+async def infer_status(request: 'web.Request'):
+  status = ENGINE.status()
+  status["manual_infer_mode"] = Params().get_bool("ManualInferMode")
+  status["log"] = Params().get("ManualInferStatus") or ""
+  return web.json_response(status)
+
+
+async def infer_start(request: 'web.Request'):
+  Params().put_bool("ManualInferMode", True)
+  return web.json_response(ENGINE.start())
+
+
+async def infer_stop(request: 'web.Request'):
+  Params().put_bool("ManualInferMode", False)
+  return web.json_response(ENGINE.stop())
+
+
+async def infer_step(request: 'web.Request'):
+  return web.json_response(ENGINE.step_once())
+
+
 async def offer(request: 'web.Request'):
   params = await request.json()
   body = StreamRequestBody(params["sdp"], ["driver"], ["testJoystick"], ["carState"])
@@ -77,6 +102,10 @@ def main():
   app = web.Application()
   app.router.add_get("/", index)
   app.router.add_get("/ping", ping, allow_head=True)
+  app.router.add_get("/status", infer_status)
+  app.router.add_post("/start", infer_start)
+  app.router.add_post("/stop", infer_stop)
+  app.router.add_post("/step", infer_step)
   app.router.add_post("/offer", offer)
   app.router.add_static('/static', os.path.join(TELEOPDIR, 'static'))
   web.run_app(app, access_log=None, host="0.0.0.0", port=5000, ssl_context=ssl_context)

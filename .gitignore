@@ -95,3 +95,12 @@ SKILL.md
 !.idea/customTargets.xml
 !.idea/tools/*
 !.run/*
+
+### Drift dev ###
+irl_control_vae.py
+irl_sim_train.py
+irl_train.py
+irl_transition.py
+irl_vae.py
+policy_epoch_0050.keras
+scripts/upload_irl_dataset_to_s3.py

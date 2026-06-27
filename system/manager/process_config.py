@@ -43,6 +43,9 @@ def joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
 def not_joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not params.get_bool("JoystickDebugMode")
 
+def not_manual_infer(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and not params.get_bool("ManualInferMode")
+
 def long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("LongitudinalManeuverMode")
 
@@ -121,8 +124,8 @@ procs = [
   PythonProcess("micd", "system.micd", iscar),
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),
 
-  PythonProcess("modeld", "selfdrive.modeld.modeld", and_(only_onroad, is_stock_model)),
-  PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
+  PythonProcess("modeld", "selfdrive.modeld.modeld", and_(only_onroad, is_stock_model, not_manual_infer)),
+  PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", and_(driverview, not_manual_infer), enabled=(WEBCAM or not PC)),
 
   PythonProcess("sensord", "system.sensord.sensord", only_onroad, enabled=not PC),
   PythonProcess("ui", "selfdrive.ui.ui", always_run, restart_if_crash=True),
@@ -143,10 +146,10 @@ procs = [
   PythonProcess("lagd", "selfdrive.locationd.lagd", only_onroad),
   PythonProcess("ubloxd", "system.ubloxd.ubloxd", ublox, enabled=TICI),
   PythonProcess("pigeond", "system.ubloxd.pigeond", ublox, enabled=TICI),
-  PythonProcess("plannerd", "selfdrive.controls.plannerd", not_long_maneuver),
+  PythonProcess("plannerd", "selfdrive.controls.plannerd", and_(not_long_maneuver, not_manual_infer)),
   PythonProcess("maneuversd", "tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("lateral_maneuversd", "tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver),
-  PythonProcess("radard", "selfdrive.controls.radard", only_onroad),
+  PythonProcess("radard", "selfdrive.controls.radard", and_(only_onroad, not_manual_infer)),
   PythonProcess("hardwared", "system.hardware.hardwared", always_run),
   PythonProcess("tombstoned", "system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "system.updated.updated", only_offroad, enabled=not PC),
@@ -170,7 +173,8 @@ procs = [
 procs += [
   # Models
   PythonProcess("models_manager", "sunnypilot.models.manager", only_offroad),
-  NativeProcess("modeld_tinygrad", "sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model)),
+  NativeProcess("modeld_tinygrad", "sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model, not_manual_infer)),
+  PythonProcess("manual_inferd", "tools.bodyteleop.manual_inferd", and_(only_onroad, lambda started, params, CP: params.get_bool("ManualInferMode")), restart_if_crash=True),
 
   # Backup
   PythonProcess("backup_manager", "sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
