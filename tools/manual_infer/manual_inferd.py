@@ -154,6 +154,10 @@ def main():
       }
 
       if model_output is not None:
+        if model.PLANPLUS_CONTROL:
+          model_output['plan'] = model_output['planplus']
+          model_output['plan_stds'] = model_output['planplus_stds']
+
         action = model.get_action_from_model(model_output, prev_action, lat_delay + DT_MDL, model.LONG_SMOOTH_SECONDS + DT_MDL, v_ego)
         prev_action = action
 
