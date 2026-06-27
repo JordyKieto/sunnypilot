@@ -15,6 +15,8 @@ class MetadataOnnxPBParser(OnnxPBParser):
       match fid:
         case 7:
           obj["graph"] = self._parse_GraphProto()
+        case 8: # opset_import
+          self.reader.skip_field(wire_type)
         case 14:
           obj["metadata_props"].append(self._parse_StringStringEntryProto())
         case _:
