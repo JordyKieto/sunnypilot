@@ -24,6 +24,8 @@ LIVE_REFRESH_S = 0.2
 UI_REFRESH_S = 1.0
 INFERENCE_REFRESH_S = 0.2
 LIVE_SAMPLER_STALE_S = 2.0
+LIVE_FRAME_STALE_S = 2.0
+LIVE_MESSAGING_TIMEOUT_MS = 50
 STACK_SIZE = 51
 VAE_LATENT_DIM = 128
 CONTROL_HISTORY_DIM = 4
@@ -111,6 +113,11 @@ class LiveSampler(threading.Thread):
     self._last_loop_time = 0.0
     self._loop_count = 0
     self._frame_count = 0
+    self._stream_connect_count = 0
+    self._stream_reconnect_count = 0
+    self._last_stream_connect_time = 0.0
+    self._last_stream_reconnect_time = 0.0
+    self._last_stream_reconnect_reason: str | None = None
     self._latest = self._make_stub_sample()
 
   def current(self) -> LiveSample:
@@ -121,9 +128,23 @@ class LiveSampler(threading.Thread):
     with self._lock:
       sm_seen = {}
       sm_updated = {}
+      sm_alive = {}
+      sm_valid = {}
+      sm_age = {}
+      sm_recv_frame = {}
+      sm_log_mono_time = {}
+      now = time.time()
       if self._sm is not None:
-        sm_seen = {key: bool(self._sm.seen.get(key, False)) for key in ("carState", "roadCameraState", "carControl", "deviceState")}
-        sm_updated = {key: bool(self._sm.updated.get(key, False)) for key in ("carState", "roadCameraState", "carControl", "deviceState")}
+        for key in ("carState", "roadCameraState", "carControl", "controlsState", "deviceState"):
+          sm_seen[key] = bool(self._sm.seen.get(key, False))
+          sm_updated[key] = bool(self._sm.updated.get(key, False))
+          sm_alive[key] = bool(self._sm.alive.get(key, False))
+          sm_valid[key] = bool(self._sm.valid.get(key, False))
+          recv_time = float(self._sm.recv_time.get(key, 0.0) or 0.0)
+          sm_age[key] = now - recv_time if recv_time > 0.0 else None
+          sm_recv_frame[key] = int(self._sm.recv_frame.get(key, 0) or 0)
+          sm_log_mono_time[key] = int(self._sm.logMonoTime.get(key, 0) or 0)
+      last_frame_age = now - self._last_frame_time if self._last_frame_time > 0.0 else None
       return {
         "messagingAvailable": messaging is not None,
         "messagingImportError": MESSAGING_IMPORT_ERROR,
@@ -137,8 +158,14 @@ class LiveSampler(threading.Thread):
         "vipcHeight": int(getattr(self._vipc_client, "height", 0) or 0) if self._vipc_client is not None else 0,
         "vipcBufferLen": int(getattr(self._vipc_client, "buffer_len", 0) or 0) if self._vipc_client is not None else 0,
         "lastFrameTime": self._last_frame_time,
+        "lastFrameAgeSeconds": last_frame_age,
         "lastFrameId": self._last_frame_id,
         "frameCount": self._frame_count,
+        "streamConnectCount": self._stream_connect_count,
+        "streamReconnectCount": self._stream_reconnect_count,
+        "lastStreamConnectTime": self._last_stream_connect_time,
+        "lastStreamReconnectTime": self._last_stream_reconnect_time,
+        "lastStreamReconnectReason": self._last_stream_reconnect_reason,
         "lastLoopTime": self._last_loop_time,
         "loopCount": self._loop_count,
         "alive": self.is_alive(),
@@ -146,6 +173,11 @@ class LiveSampler(threading.Thread):
         "lastStreamError": self._last_stream_error,
         "seen": sm_seen,
         "updated": sm_updated,
+        "aliveServices": sm_alive,
+        "validServices": sm_valid,
+        "serviceAgeSeconds": sm_age,
+        "recvFrame": sm_recv_frame,
+        "logMonoTime": sm_log_mono_time,
       }
 
   def stop(self) -> None:
@@ -155,12 +187,26 @@ class LiveSampler(threading.Thread):
     with self._lock:
       self._latest = sample
 
+  def _drop_camera_client(self, reason: str) -> None:
+    if self._vipc_client is None:
+      return
+    self._last_stream_reconnect_reason = reason
+    self._last_stream_reconnect_time = time.time()
+    self._stream_reconnect_count += 1
+    cloudlog.warning("shadowmode reconnecting camera stream: %s", reason)
+    self._vipc_client = None
+    self._vipc_stream = None
+
+  def _frame_is_stale(self, now: float) -> bool:
+    return self._last_frame_time > 0.0 and now - self._last_frame_time > LIVE_FRAME_STALE_S
+
   def _init_streams(self) -> None:
     if messaging is None:
       self._last_stream_error = f"messaging unavailable: {MESSAGING_IMPORT_ERROR}"
       return
     if self._sm is None:
-      self._sm = messaging.SubMaster(["carState", "roadCameraState", "liveCalibration", "deviceState", "carControl", "liveDelay"])
+      services = ["carState", "roadCameraState", "liveCalibration", "deviceState", "carControl", "controlsState", "liveDelay"]
+      self._sm = messaging.SubMaster(services, poll="carState")
     if VisionIpcClient is None or VisionStreamType is None or self._vipc_client is not None:
       if VisionIpcClient is None or VisionStreamType is None:
         self._last_stream_error = f"VisionIPC unavailable: {VISIONIPC_IMPORT_ERROR}"
@@ -179,6 +225,8 @@ class LiveSampler(threading.Thread):
     if client.connect(False):
       self._vipc_client = client
       self._vipc_stream = str(stream)
+      self._stream_connect_count += 1
+      self._last_stream_connect_time = time.time()
       self._last_stream_error = None
       cloudlog.info("shadowmode connected camera stream=%s size=%sx%s buffer_len=%s", self._vipc_stream, client.width, client.height, client.buffer_len)
     else:
@@ -238,6 +286,10 @@ class LiveSampler(threading.Thread):
     buf = self._vipc_client.recv(timeout_ms=0)
     if buf is None:
       self._last_stream_error = "VisionIPC recv returned no frame"
+      if self._frame_is_stale(time.time()):
+        self._drop_camera_client(
+          f"no frame for {time.time() - self._last_frame_time:.1f}s"
+        )
       return None
     self._last_frame_time = time.time()
     self._last_frame_id = int(getattr(self._vipc_client, "frame_id", -1))
@@ -269,6 +321,18 @@ class LiveSampler(threading.Thread):
     now = time.time()
     car_state = self._sm["carState"] if self._sm is not None else None
     car_control = self._sm["carControl"] if self._sm is not None else None
+    car_state_age = None
+    car_state_seen = False
+    car_state_updated = False
+    car_state_alive = False
+    car_state_valid = False
+    if self._sm is not None:
+      recv_time = float(self._sm.recv_time.get("carState", 0.0) or 0.0)
+      car_state_age = now - recv_time if recv_time > 0.0 else None
+      car_state_seen = bool(self._sm.seen.get("carState", False))
+      car_state_updated = bool(self._sm.updated.get("carState", False))
+      car_state_alive = bool(self._sm.alive.get("carState", False))
+      car_state_valid = bool(self._sm.valid.get("carState", False))
     speed = self._clip(self._to_float(getattr(car_state, "vEgo", 0.0) if car_state is not None else 0.0) / 30.0, 0.0, 2.0)
     gas = self._clip(self._to_float(getattr(car_state, "gas", 0.0) if car_state is not None else 0.0), 0.0, 1.0)
     brake = self._clip(self._to_float(getattr(car_state, "brake", 0.0) if car_state is not None else 0.0), 0.0, 1.0)
@@ -299,7 +363,12 @@ class LiveSampler(threading.Thread):
         "steering_rate": steering_rate,
         "command_accel": self._to_float(self._nested_attr(car_control, "actuators.accel", 0.0)),
         "command_torque": self._to_float(self._nested_attr(car_control, "actuators.torque", 0.0)),
-        "source": "device" if self._sm is not None else "stub",
+        "source": "device" if car_state_seen else ("device_waiting_for_carState" if self._sm is not None else "stub"),
+        "car_state_seen": car_state_seen,
+        "car_state_updated": car_state_updated,
+        "car_state_alive": car_state_alive,
+        "car_state_valid": car_state_valid,
+        "car_state_age_seconds": car_state_age,
         "has_live_rgb": image is not None,
       },
       timestamp=now,
@@ -336,7 +405,7 @@ class LiveSampler(threading.Thread):
         self._loop_count += 1
         self._init_streams()
         if self._sm is not None:
-          self._sm.update(0)
+          self._sm.update(LIVE_MESSAGING_TIMEOUT_MS)
           self._update_latest(self._make_sample())
         else:
           self._update_latest(self._make_stub_sample())
@@ -720,7 +789,10 @@ class ShadowInferenceWorker(threading.Thread):
     if self._vae_session is None:
       return sample, {"ran": False, "reason": "vae not loaded"}
     if sample.image is None:
-      return sample, {"ran": False, "reason": "no live rgb frame", "camera": LIVE_SAMPLER.diagnostics()}
+      camera = LIVE_SAMPLER.diagnostics()
+      frame_age = camera.get("lastFrameAgeSeconds")
+      reason = "no fresh live rgb frame" if frame_age is not None else "no live rgb frame"
+      return sample, {"ran": False, "reason": reason, "frameAgeSeconds": frame_age, "camera": camera}
     image_batch = sample.image.reshape((1, 96, 160, 3)).astype(np.uint8)
     outputs = self._vae_session.run_inputs({self._vae_input_name(): image_batch})
     latent = self._select_vae_latent(outputs)
