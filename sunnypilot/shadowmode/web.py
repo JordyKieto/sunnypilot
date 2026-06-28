@@ -427,6 +427,8 @@ class TinygradOnnxSession:
 
 MODEL_REVISION = 0
 VAE_REVISION = 0
+MODEL_UPLOAD: dict[str, Any] = {"bytes": 0, "time": 0.0, "revision": 0}
+VAE_UPLOAD: dict[str, Any] = {"bytes": 0, "time": 0.0, "revision": 0}
 LIVE_SAMPLER = LiveSampler()
 LIVE_SAMPLER.start()
 
@@ -438,6 +440,7 @@ class ShadowInferenceWorker(threading.Thread):
     super().__init__(name="shadowmode-inference")
     self._lock = threading.Lock()
     self._stop = threading.Event()
+    self._started_once = False
     self._enabled = False
     self._model_rev_seen = -1
     self._vae_rev_seen = -1
@@ -452,12 +455,19 @@ class ShadowInferenceWorker(threading.Thread):
       "lastVaeDurationMs": 0.0,
       "policyLoadTime": 0.0,
       "vaeLoadTime": 0.0,
+      "policyLoadedRevision": 0,
+      "vaeLoadedRevision": 0,
+      "policyFailedRevision": 0,
+      "vaeFailedRevision": 0,
       "policyRunCount": 0,
       "vaeRunCount": 0,
       "policyErrorCount": 0,
       "vaeErrorCount": 0,
       "lastPolicyError": None,
       "lastVaeError": None,
+      "workerError": None,
+      "workerHeartbeatTime": 0.0,
+      "workerLoopCount": 0,
       "lastInference": None,
       "lastVaeRuntime": {"ran": False},
       "hasModel": False,
@@ -508,6 +518,7 @@ class ShadowInferenceWorker(threading.Thread):
             outputs=self._session.outputs_meta,
             lastPolicyError=None,
             policyLoadTime=time.time(),
+            policyLoadedRevision=self._model_rev_seen,
           )
           cloudlog.info("shadowmode policy model loaded: %s", MODEL_PATH)
         except Exception as e:
@@ -519,6 +530,7 @@ class ShadowInferenceWorker(threading.Thread):
             inputs=[],
             outputs=[],
             lastPolicyError=str(e),
+            policyFailedRevision=self._model_rev_seen,
             policyErrorCount=self._state.get("policyErrorCount", 0) + 1,
           )
           cloudlog.exception("shadowmode policy model load failed: %s", e)
@@ -536,6 +548,7 @@ class ShadowInferenceWorker(threading.Thread):
             vaeOutputs=self._vae_session.outputs_meta,
             lastVaeError=None,
             vaeLoadTime=time.time(),
+            vaeLoadedRevision=self._vae_rev_seen,
           )
           cloudlog.info("shadowmode vae model loaded: %s", VAE_PATH)
         except Exception as e:
@@ -547,6 +560,7 @@ class ShadowInferenceWorker(threading.Thread):
             vaeInputs=[],
             vaeOutputs=[],
             lastVaeError=str(e),
+            vaeFailedRevision=self._vae_rev_seen,
             vaeErrorCount=self._state.get("vaeErrorCount", 0) + 1,
           )
           cloudlog.exception("shadowmode vae model load failed: %s", e)
@@ -634,18 +648,46 @@ class ShadowInferenceWorker(threading.Thread):
 
   def run(self) -> None:
     while not self._stop.is_set():
-      self._load_changed_models()
-      with self._lock:
-        enabled = self._enabled
-      if enabled:
-        self._run_once()
-      else:
-        self._set_state(running=False)
+      try:
+        self._load_changed_models()
+        with self._lock:
+          enabled = self._enabled
+        if enabled:
+          self._run_once()
+        else:
+          self._set_state(running=False)
+        self._set_state(
+          workerError=None,
+          workerHeartbeatTime=time.time(),
+          workerLoopCount=self._state.get("workerLoopCount", 0) + 1,
+        )
+      except Exception as e:
+        self._set_state(
+          running=False,
+          workerError=str(e),
+          workerHeartbeatTime=time.time(),
+          workerLoopCount=self._state.get("workerLoopCount", 0) + 1,
+        )
+        cloudlog.exception("shadowmode inference worker loop failed: %s", e)
       time.sleep(INFERENCE_REFRESH_S)
 
 
 INFERENCE_WORKER = ShadowInferenceWorker()
-INFERENCE_WORKER.start()
+
+
+def _ensure_inference_worker_started() -> None:
+  global INFERENCE_WORKER
+  if INFERENCE_WORKER.is_alive():
+    return
+  if INFERENCE_WORKER._started_once:
+    cloudlog.error("shadowmode inference worker was dead; creating replacement worker")
+    replacement = ShadowInferenceWorker()
+    replacement._enabled = INFERENCE_WORKER.snapshot().get("enabled", False)
+    replacement._state["enabled"] = replacement._enabled
+    INFERENCE_WORKER = replacement
+  INFERENCE_WORKER._started_once = True
+  INFERENCE_WORKER.start()
+  cloudlog.info("shadowmode inference worker thread started")
 
 
 def _read_upload(body: bytes, path: Path) -> None:
@@ -653,15 +695,40 @@ def _read_upload(body: bytes, path: Path) -> None:
 
 
 def _status() -> dict[str, Any]:
+  _ensure_inference_worker_started()
   current = LIVE_SAMPLER.current()
   worker = INFERENCE_WORKER.snapshot()
   latest = worker.get("lastInference") or {}
+  model_uploaded = MODEL_UPLOAD["revision"] > 0
+  vae_uploaded = VAE_UPLOAD["revision"] > 0
+  policy_loaded_revision = worker["policyLoadedRevision"]
+  vae_loaded_revision = worker["vaeLoadedRevision"]
+  policy_failed_revision = worker["policyFailedRevision"]
+  vae_failed_revision = worker["vaeFailedRevision"]
+  policy_state = "loaded" if policy_loaded_revision == MODEL_REVISION and MODEL_REVISION > 0 else (
+    "load_failed" if policy_failed_revision == MODEL_REVISION and MODEL_REVISION > 0 else (
+      "loading" if model_uploaded else "not_uploaded"
+    )
+  )
+  vae_state = "loaded" if vae_loaded_revision == VAE_REVISION and VAE_REVISION > 0 else (
+    "load_failed" if vae_failed_revision == VAE_REVISION and VAE_REVISION > 0 else (
+      "loading" if vae_uploaded else "not_uploaded"
+    )
+  )
   return {
     "ok": True,
     "inferenceEnabled": worker["enabled"],
     "running": worker["running"],
+    "workerAlive": INFERENCE_WORKER.is_alive(),
+    "workerError": worker["workerError"],
+    "workerHeartbeatTime": worker["workerHeartbeatTime"],
+    "workerLoopCount": worker["workerLoopCount"],
     "hasModelFile": MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 0,
     "hasVaeFile": VAE_PATH.exists() and VAE_PATH.stat().st_size > 0,
+    "policyState": policy_state,
+    "vaeState": vae_state,
+    "modelUpload": dict(MODEL_UPLOAD),
+    "vaeUpload": dict(VAE_UPLOAD),
     "hasModel": worker["hasModel"],
     "modelReady": worker["modelReady"],
     "hasVae": worker["hasVae"],
@@ -684,6 +751,10 @@ def _status() -> dict[str, Any]:
     "vaeLoadTime": worker["vaeLoadTime"],
     "modelRevision": MODEL_REVISION,
     "vaeRevision": VAE_REVISION,
+    "policyLoadedRevision": policy_loaded_revision,
+    "vaeLoadedRevision": vae_loaded_revision,
+    "policyFailedRevision": policy_failed_revision,
+    "vaeFailedRevision": vae_failed_revision,
     "policyRunCount": worker["policyRunCount"],
     "vaeRunCount": worker["vaeRunCount"],
     "policyErrorCount": worker["policyErrorCount"],
@@ -733,42 +804,50 @@ class ShadowHandler(SimpleHTTPRequestHandler):
 
   def do_POST(self) -> None:
     if self.path == "/shadow/upload":
-      global MODEL_REVISION
+      _ensure_inference_worker_started()
+      global MODEL_REVISION, MODEL_UPLOAD
       length = int(self.headers.get("Content-Length", "0"))
       body = self.rfile.read(length)
       _read_upload(body, MODEL_PATH)
       MODEL_REVISION += 1
+      MODEL_UPLOAD = {"bytes": len(body), "time": time.time(), "revision": MODEL_REVISION}
       cloudlog.info("shadowmode policy upload received: bytes=%d revision=%d path=%s", len(body), MODEL_REVISION, MODEL_PATH)
       self._send_json({
         "ok": True,
-        "message": "model uploaded; backend worker will load it",
+        "message": "policy uploaded; backend worker is loading it",
         "bytes": len(body),
         "modelRevision": MODEL_REVISION,
+        "upload": dict(MODEL_UPLOAD),
         "modelPath": str(MODEL_PATH),
         "status": _status(),
       })
       return
     if self.path == "/shadow/upload_vae":
-      global VAE_REVISION
+      _ensure_inference_worker_started()
+      global VAE_REVISION, VAE_UPLOAD
       length = int(self.headers.get("Content-Length", "0"))
       body = self.rfile.read(length)
       _read_upload(body, VAE_PATH)
       VAE_REVISION += 1
+      VAE_UPLOAD = {"bytes": len(body), "time": time.time(), "revision": VAE_REVISION}
       cloudlog.info("shadowmode vae upload received: bytes=%d revision=%d path=%s", len(body), VAE_REVISION, VAE_PATH)
       self._send_json({
         "ok": True,
-        "message": "vae uploaded; backend worker will load it",
+        "message": "vae uploaded; backend worker is loading it",
         "bytes": len(body),
         "vaeRevision": VAE_REVISION,
+        "upload": dict(VAE_UPLOAD),
         "vaePath": str(VAE_PATH),
         "status": _status(),
       })
       return
     if self.path == "/shadow/start":
+      _ensure_inference_worker_started()
       INFERENCE_WORKER.start_inference()
       self._send_json({"ok": True, "message": "inference started", "status": _status()})
       return
     if self.path == "/shadow/stop":
+      _ensure_inference_worker_started()
       INFERENCE_WORKER.stop_inference()
       self._send_json({"ok": True, "message": "inference stopped", "status": _status()})
       return
@@ -776,6 +855,7 @@ class ShadowHandler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+  _ensure_inference_worker_started()
   # Tinygrad's ONNX runner can keep SQLite state that is tied to the thread that
   # created it, so handle upload and inference requests on the same server thread.
   server = HTTPServer(("0.0.0.0", 5051), ShadowHandler)
