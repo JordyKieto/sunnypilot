@@ -18,6 +18,8 @@ from openpilot.common.swaglog import cloudlog
 STATIC_DIR = Path(BASEDIR) / "sunnypilot" / "shadowmode" / "static"
 MODEL_PATH = Path(tempfile.gettempdir()) / "shadowmode_model.onnx"
 VAE_PATH = Path(tempfile.gettempdir()) / "shadowmode_vae.onnx"
+PERSISTENT_ROOT = Path("/data/openpilot") if Path("/data/openpilot").exists() else Path(BASEDIR)
+LOG_DIR = PERSISTENT_ROOT / "sunnypilot" / "shadowmode" / "logs"
 LIVE_REFRESH_S = 0.2
 UI_REFRESH_S = 1.0
 INFERENCE_REFRESH_S = 0.2
@@ -535,6 +537,8 @@ class ShadowInferenceWorker(threading.Thread):
     self._vae_rev_seen = -1
     self._session: TinygradOnnxSession | None = None
     self._vae_session: TinygradOnnxSession | None = None
+    self._log_path: Path | None = None
+    self._log_count = 0
     self._state: dict[str, Any] = {
       "enabled": False,
       "running": False,
@@ -558,6 +562,8 @@ class ShadowInferenceWorker(threading.Thread):
       "workerHeartbeatTime": 0.0,
       "workerLoopCount": 0,
       "lastInference": None,
+      "sessionLogPath": None,
+      "sessionLogCount": 0,
       "lastVaeRuntime": {"ran": False},
       "hasModel": False,
       "modelReady": False,
@@ -572,17 +578,33 @@ class ShadowInferenceWorker(threading.Thread):
     }
 
   def start_inference(self) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / time.strftime("shadowmode_%Y%m%d_%H%M%S.jsonl")
+    metadata = {
+      "type": "session_start",
+      "time": time.time(),
+      "modelPath": str(MODEL_PATH),
+      "vaePath": str(VAE_PATH),
+      "modelRevision": MODEL_REVISION,
+      "vaeRevision": VAE_REVISION,
+    }
+    with log_path.open("w") as file:
+      file.write(json.dumps(metadata, sort_keys=True) + "\n")
     with self._lock:
       self._enabled = True
+      self._log_path = log_path
+      self._log_count = 1
       self._state["enabled"] = True
-    cloudlog.info("shadowmode inference started")
+      self._state["sessionLogPath"] = str(log_path)
+      self._state["sessionLogCount"] = 1
+    cloudlog.info("shadowmode inference started log=%s", log_path)
 
   def stop_inference(self) -> None:
     with self._lock:
       self._enabled = False
       self._state["enabled"] = False
       self._state["running"] = False
-    cloudlog.info("shadowmode inference stopped")
+    cloudlog.info("shadowmode inference stopped log=%s rows=%d", self._log_path, self._log_count)
 
   def snapshot(self) -> dict[str, Any]:
     with self._lock:
@@ -591,6 +613,26 @@ class ShadowInferenceWorker(threading.Thread):
   def _set_state(self, **values: Any) -> None:
     with self._lock:
       self._state.update(values)
+
+  def _append_session_log(self, result: dict[str, Any], vae_runtime: dict[str, Any]) -> None:
+    with self._lock:
+      log_path = self._log_path
+    if log_path is None:
+      return
+    row = {
+      "time": time.time(),
+      "actual": result.get("actual", {}),
+      "predicted": result.get("predicted", {}),
+      "vaeRuntime": vae_runtime,
+      "modelType": result.get("modelType"),
+      "outputs": result.get("outputs", []),
+      "inputShapes": result.get("inputShapes", []),
+    }
+    with log_path.open("a") as file:
+      file.write(json.dumps(row, sort_keys=True) + "\n")
+    with self._lock:
+      self._log_count += 1
+      self._state["sessionLogCount"] = self._log_count
 
   def _load_changed_models(self) -> None:
     global MODEL_REVISION, VAE_REVISION
@@ -718,6 +760,7 @@ class ShadowInferenceWorker(threading.Thread):
       policy_start = time.monotonic()
       result = self._session.run(sample)
       now = time.time()
+      self._append_session_log(result, vae_runtime)
       self._set_state(
         running=True,
         lastPolicyRunTime=now,
@@ -863,6 +906,8 @@ def _status() -> dict[str, Any]:
     "vaeFailedRevision": vae_failed_revision,
     "policyRunCount": worker["policyRunCount"],
     "vaeRunCount": worker["vaeRunCount"],
+    "sessionLogPath": worker["sessionLogPath"],
+    "sessionLogCount": worker["sessionLogCount"],
     "policyErrorCount": worker["policyErrorCount"],
     "vaeErrorCount": worker["vaeErrorCount"],
     "lastPolicyError": worker["lastPolicyError"],
