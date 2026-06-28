@@ -19,8 +19,11 @@
       input[type=file], textarea, button { width: 100%; font: inherit; }
       textarea { min-height: 120px; }
       button { min-height: 44px; border: 0; border-radius: 8px; background: #126e5c; color: white; font-weight: 700; }
+      button.secondary { background: #2f3b45; }
+      button.danger { background: #9f1c1c; }
       pre { margin: 0; white-space: pre-wrap; }
       .muted { color: #66707a; }
+      .small { font-size: 13px; line-height: 1.45; }
     </style>
   </head>
   <body>
@@ -37,6 +40,14 @@
       <section>
         <input id="vae" type="file" accept=".onnx">
         <button id="uploadVae">Upload VAE Model</button>
+      </section>
+
+      <section>
+        <div class="row">
+          <button id="start" class="secondary">Start Backend Inference</button>
+          <button id="stop" class="danger">Stop Backend Inference</button>
+        </div>
+        <p class="small muted" id="runtime">Backend inference is stopped.</p>
       </section>
 
       <section>
@@ -70,17 +81,22 @@
       }
       function render(body) {
         $("status").textContent = JSON.stringify(body, null, 2);
-        $("conn").textContent = body.hasModel ? "model loaded" : "waiting for upload";
-        $("conn").className = body.hasModel ? "pill ok" : "pill bad";
-        $("vaeState").textContent = body.hasVae ? "vae loaded" : "vae not loaded";
-        $("vaeState").className = body.hasVae ? "pill ok" : "pill";
-        $("runstate").textContent = body.inferenceError ? "inference error" : (body.running ? "inference running" : "idle");
-        $("runstate").className = body.inferenceError ? "pill bad" : (body.running ? "pill ok" : "pill");
+        $("conn").textContent = body.modelReady ? "policy loaded" : (body.hasModelFile ? "policy loading" : "waiting for policy");
+        $("conn").className = body.modelReady ? "pill ok" : "pill bad";
+        $("vaeState").textContent = body.vaeReady ? "vae loaded" : (body.hasVaeFile ? "vae loading" : "vae not loaded");
+        $("vaeState").className = body.vaeReady ? "pill ok" : "pill";
+        $("runstate").textContent = body.lastPolicyError ? "inference error" : (body.running ? "backend running" : (body.inferenceEnabled ? "starting" : "stopped"));
+        $("runstate").className = body.lastPolicyError ? "pill bad" : (body.running ? "pill ok" : "pill");
         const age = body.liveTimestamp ? Math.max(0, (Date.now() / 1000) - body.liveTimestamp).toFixed(1) : null;
         $("fresh").textContent = age == null ? "no sample yet" : `sample age ${age}s`;
         $("fresh").className = age != null && age < 2 ? "pill ok" : "pill bad";
         $("actual").textContent = body.actual ? `speed ${body.actual.speed ?? 0}, throttle ${body.actual.throttle ?? 0}, brake ${body.actual.brake ?? 0}, steering ${body.actual.steering ?? 0}` : "-";
         $("predicted").textContent = body.predicted ? `${body.predicted.pedal_state?.name || "-"} | throttle ${body.predicted.throttle ?? 0}, brake ${body.predicted.brake ?? 0}, steering ${body.predicted.steering ?? 0}` : "-";
+        const policyAge = body.lastPolicyRunTime ? `${Math.max(0, (Date.now() / 1000) - body.lastPolicyRunTime).toFixed(1)}s ago` : "never";
+        const vaeAge = body.lastVaeRunTime ? `${Math.max(0, (Date.now() / 1000) - body.lastVaeRunTime).toFixed(1)}s ago` : "never";
+        const policyMs = Number(body.lastPolicyDurationMs || 0).toFixed(1);
+        const vaeMs = Number(body.lastVaeDurationMs || 0).toFixed(1);
+        $("runtime").textContent = `enabled=${!!body.inferenceEnabled}, running=${!!body.running}, policy runs=${body.policyRunCount ?? 0} (${policyAge}, ${policyMs}ms), vae runs=${body.vaeRunCount ?? 0} (${vaeAge}, ${vaeMs}ms), policy errors=${body.policyErrorCount ?? 0}, vae errors=${body.vaeErrorCount ?? 0}`;
       }
       $("upload").addEventListener("click", async () => {
         const file = $("model").files[0];
@@ -112,6 +128,28 @@
           $("status").textContent = JSON.stringify(e, null, 2);
           $("vaeState").textContent = "vae upload failed";
           $("vaeState").className = "pill bad";
+        }
+      });
+      $("start").addEventListener("click", async () => {
+        $("status").textContent = "Starting backend inference...";
+        try {
+          const body = await request("/shadow/start", {method: "POST"});
+          render(body.status || body);
+        } catch (e) {
+          $("status").textContent = JSON.stringify(e, null, 2);
+          $("runstate").textContent = "start failed";
+          $("runstate").className = "pill bad";
+        }
+      });
+      $("stop").addEventListener("click", async () => {
+        $("status").textContent = "Stopping backend inference...";
+        try {
+          const body = await request("/shadow/stop", {method: "POST"});
+          render(body.status || body);
+        } catch (e) {
+          $("status").textContent = JSON.stringify(e, null, 2);
+          $("runstate").textContent = "stop failed";
+          $("runstate").className = "pill bad";
         }
       });
       async function refresh() {

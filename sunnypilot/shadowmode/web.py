@@ -20,6 +20,7 @@ MODEL_PATH = Path(tempfile.gettempdir()) / "shadowmode_model.onnx"
 VAE_PATH = Path(tempfile.gettempdir()) / "shadowmode_vae.onnx"
 LIVE_REFRESH_S = 0.2
 UI_REFRESH_S = 1.0
+INFERENCE_REFRESH_S = 0.2
 STACK_SIZE = 51
 VAE_LATENT_DIM = 128
 CONTROL_HISTORY_DIM = 4
@@ -424,69 +425,159 @@ class TinygradOnnxSession:
     return self._normalize_outputs(result, output_names)
 
 
-SESSION: TinygradOnnxSession | None = None
-SESSION_ERROR: str | None = None
-VAE_SESSION: TinygradOnnxSession | None = None
-VAE_ERROR: str | None = None
+MODEL_REVISION = 0
+VAE_REVISION = 0
 LIVE_SAMPLER = LiveSampler()
 LIVE_SAMPLER.start()
 
 
-def _read_upload(body: bytes, path: Path) -> None:
-  path.write_bytes(body)
+class ShadowInferenceWorker(threading.Thread):
+  daemon = True
 
+  def __init__(self) -> None:
+    super().__init__(name="shadowmode-inference")
+    self._lock = threading.Lock()
+    self._stop = threading.Event()
+    self._enabled = False
+    self._model_rev_seen = -1
+    self._vae_rev_seen = -1
+    self._session: TinygradOnnxSession | None = None
+    self._vae_session: TinygradOnnxSession | None = None
+    self._state: dict[str, Any] = {
+      "enabled": False,
+      "running": False,
+      "lastPolicyRunTime": 0.0,
+      "lastVaeRunTime": 0.0,
+      "lastPolicyDurationMs": 0.0,
+      "lastVaeDurationMs": 0.0,
+      "policyLoadTime": 0.0,
+      "vaeLoadTime": 0.0,
+      "policyRunCount": 0,
+      "vaeRunCount": 0,
+      "policyErrorCount": 0,
+      "vaeErrorCount": 0,
+      "lastPolicyError": None,
+      "lastVaeError": None,
+      "lastInference": None,
+      "lastVaeRuntime": {"ran": False},
+      "hasModel": False,
+      "modelReady": False,
+      "hasVae": False,
+      "vaeReady": False,
+      "modelType": None,
+      "vaeType": None,
+      "inputs": [],
+      "outputs": [],
+      "vaeInputs": [],
+      "vaeOutputs": [],
+    }
 
-def _load_uploaded_model() -> None:
-  global SESSION, SESSION_ERROR
-  try:
-    SESSION = TinygradOnnxSession(MODEL_PATH)
-    SESSION_ERROR = None
-  except Exception as e:
-    SESSION = None
-    SESSION_ERROR = str(e)
-    raise
+  def start_inference(self) -> None:
+    with self._lock:
+      self._enabled = True
+      self._state["enabled"] = True
+    cloudlog.info("shadowmode inference started")
 
+  def stop_inference(self) -> None:
+    with self._lock:
+      self._enabled = False
+      self._state["enabled"] = False
+      self._state["running"] = False
+    cloudlog.info("shadowmode inference stopped")
 
-def _load_uploaded_vae() -> None:
-  global VAE_SESSION, VAE_ERROR
-  try:
-    VAE_SESSION = TinygradOnnxSession(VAE_PATH)
-    VAE_ERROR = None
-  except Exception as e:
-    VAE_SESSION = None
-    VAE_ERROR = str(e)
-    raise
+  def snapshot(self) -> dict[str, Any]:
+    with self._lock:
+      return dict(self._state)
 
+  def _set_state(self, **values: Any) -> None:
+    with self._lock:
+      self._state.update(values)
 
-def _vae_input_name() -> str:
-  if VAE_SESSION is None or not VAE_SESSION.inputs_meta:
-    return "image"
-  for item in VAE_SESSION.inputs_meta:
-    name = item["name"]
-    if "image" in name.lower() or "input" in name.lower():
-      return name
-  return VAE_SESSION.inputs_meta[0]["name"]
+  def _load_changed_models(self) -> None:
+    global MODEL_REVISION, VAE_REVISION
+    if self._model_rev_seen != MODEL_REVISION:
+      self._model_rev_seen = MODEL_REVISION
+      if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 0:
+        try:
+          self._session = TinygradOnnxSession(MODEL_PATH)
+          self._set_state(
+            hasModel=True,
+            modelReady=True,
+            modelType=self._session.model_type,
+            inputs=self._session.inputs_meta,
+            outputs=self._session.outputs_meta,
+            lastPolicyError=None,
+            policyLoadTime=time.time(),
+          )
+          cloudlog.info("shadowmode policy model loaded: %s", MODEL_PATH)
+        except Exception as e:
+          self._session = None
+          self._set_state(
+            hasModel=False,
+            modelReady=False,
+            modelType=None,
+            inputs=[],
+            outputs=[],
+            lastPolicyError=str(e),
+            policyErrorCount=self._state.get("policyErrorCount", 0) + 1,
+          )
+          cloudlog.exception("shadowmode policy model load failed: %s", e)
 
+    if self._vae_rev_seen != VAE_REVISION:
+      self._vae_rev_seen = VAE_REVISION
+      if VAE_PATH.exists() and VAE_PATH.stat().st_size > 0:
+        try:
+          self._vae_session = TinygradOnnxSession(VAE_PATH)
+          self._set_state(
+            hasVae=True,
+            vaeReady=True,
+            vaeType=self._vae_session.model_type,
+            vaeInputs=self._vae_session.inputs_meta,
+            vaeOutputs=self._vae_session.outputs_meta,
+            lastVaeError=None,
+            vaeLoadTime=time.time(),
+          )
+          cloudlog.info("shadowmode vae model loaded: %s", VAE_PATH)
+        except Exception as e:
+          self._vae_session = None
+          self._set_state(
+            hasVae=False,
+            vaeReady=False,
+            vaeType=None,
+            vaeInputs=[],
+            vaeOutputs=[],
+            lastVaeError=str(e),
+            vaeErrorCount=self._state.get("vaeErrorCount", 0) + 1,
+          )
+          cloudlog.exception("shadowmode vae model load failed: %s", e)
 
-def _select_vae_latent(outputs: dict[str, np.ndarray]) -> np.ndarray:
-  if not outputs:
-    raise RuntimeError("VAE produced no outputs")
-  for key in outputs:
-    if "z_mean" in key or "mean" in key:
-      return np.asarray(outputs[key], dtype=np.float32).reshape(-1)[-VAE_LATENT_DIM:]
-  first = next(iter(outputs.values()))
-  return np.asarray(first, dtype=np.float32).reshape(-1)[-VAE_LATENT_DIM:]
+  def _vae_input_name(self) -> str:
+    if self._vae_session is None or not self._vae_session.inputs_meta:
+      return "image"
+    for item in self._vae_session.inputs_meta:
+      name = item["name"]
+      if "image" in name.lower() or "input" in name.lower():
+        return name
+    return self._vae_session.inputs_meta[0]["name"]
 
+  @staticmethod
+  def _select_vae_latent(outputs: dict[str, np.ndarray]) -> np.ndarray:
+    if not outputs:
+      raise RuntimeError("VAE produced no outputs")
+    for key in outputs:
+      if "image_latent" in key or "z_mean" in key or "mean" in key:
+        return np.asarray(outputs[key], dtype=np.float32).reshape(-1)[-VAE_LATENT_DIM:]
+    first = next(iter(outputs.values()))
+    return np.asarray(first, dtype=np.float32).reshape(-1)[-VAE_LATENT_DIM:]
 
-def _encode_live_image(sample: LiveSample) -> tuple[LiveSample, dict[str, Any]]:
-  if VAE_SESSION is None:
-    return sample, {"ran": False, "reason": "vae not loaded"}
-  if sample.image is None:
-    return sample, {"ran": False, "reason": "no live rgb frame"}
-  try:
+  def _encode_live_image(self, sample: LiveSample) -> tuple[LiveSample, dict[str, Any]]:
+    if self._vae_session is None:
+      return sample, {"ran": False, "reason": "vae not loaded"}
+    if sample.image is None:
+      return sample, {"ran": False, "reason": "no live rgb frame"}
     image_batch = sample.image.reshape((1, 96, 160, 3)).astype(np.uint8)
-    outputs = VAE_SESSION.run_inputs({_vae_input_name(): image_batch})
-    latent = _select_vae_latent(outputs)
+    outputs = self._vae_session.run_inputs({self._vae_input_name(): image_batch})
+    latent = self._select_vae_latent(outputs)
     updated = LIVE_SAMPLER.push_image_latent(latent)
     return updated, {
       "ran": True,
@@ -494,52 +585,124 @@ def _encode_live_image(sample: LiveSample) -> tuple[LiveSample, dict[str, Any]]:
       "latentShape": list(latent.shape),
       "imageShape": list(image_batch.shape),
     }
-  except Exception as e:
-    return sample, {"ran": False, "error": str(e)}
+
+  def _run_once(self) -> None:
+    sample = LIVE_SAMPLER.current()
+    vae_runtime = {"ran": False}
+    try:
+      vae_start = time.monotonic()
+      sample, vae_runtime = self._encode_live_image(sample)
+      if vae_runtime.get("ran"):
+        self._set_state(
+          lastVaeRunTime=time.time(),
+          lastVaeDurationMs=(time.monotonic() - vae_start) * 1000.0,
+          vaeRunCount=self._state.get("vaeRunCount", 0) + 1,
+          lastVaeError=None,
+        )
+    except Exception as e:
+      vae_runtime = {"ran": False, "error": str(e)}
+      self._set_state(
+        lastVaeError=str(e),
+        vaeErrorCount=self._state.get("vaeErrorCount", 0) + 1,
+      )
+
+    if self._session is None:
+      self._set_state(running=False, lastVaeRuntime=vae_runtime)
+      return
+
+    try:
+      policy_start = time.monotonic()
+      result = self._session.run(sample)
+      now = time.time()
+      self._set_state(
+        running=True,
+        lastPolicyRunTime=now,
+        lastPolicyDurationMs=(time.monotonic() - policy_start) * 1000.0,
+        policyRunCount=self._state.get("policyRunCount", 0) + 1,
+        lastPolicyError=None,
+        lastInference=result,
+        lastVaeRuntime=vae_runtime,
+      )
+    except Exception as e:
+      self._set_state(
+        running=False,
+        lastPolicyError=str(e),
+        policyErrorCount=self._state.get("policyErrorCount", 0) + 1,
+        lastVaeRuntime=vae_runtime,
+      )
+      cloudlog.exception("shadowmode policy inference failed: %s", e)
+
+  def run(self) -> None:
+    while not self._stop.is_set():
+      self._load_changed_models()
+      with self._lock:
+        enabled = self._enabled
+      if enabled:
+        self._run_once()
+      else:
+        self._set_state(running=False)
+      time.sleep(INFERENCE_REFRESH_S)
+
+
+INFERENCE_WORKER = ShadowInferenceWorker()
+INFERENCE_WORKER.start()
+
+
+def _read_upload(body: bytes, path: Path) -> None:
+  path.write_bytes(body)
 
 
 def _status() -> dict[str, Any]:
   current = LIVE_SAMPLER.current()
-  result = None
-  inference_error = None
-  vae_runtime = {"ran": False}
-  current, vae_runtime = _encode_live_image(current)
-  if SESSION is not None:
-    try:
-      result = SESSION.run(current)
-    except Exception as e:
-      inference_error = str(e)
+  worker = INFERENCE_WORKER.snapshot()
+  latest = worker.get("lastInference") or {}
   return {
     "ok": True,
-    "hasModel": SESSION is not None,
-    "modelReady": bool(SESSION is not None and getattr(SESSION, "ready", False)),
-    "hasVae": VAE_SESSION is not None,
-    "vaeReady": bool(VAE_SESSION is not None and getattr(VAE_SESSION, "ready", False)),
-    "running": bool(SESSION is not None and result is not None and not inference_error),
+    "inferenceEnabled": worker["enabled"],
+    "running": worker["running"],
+    "hasModelFile": MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 0,
+    "hasVaeFile": VAE_PATH.exists() and VAE_PATH.stat().st_size > 0,
+    "hasModel": worker["hasModel"],
+    "modelReady": worker["modelReady"],
+    "hasVae": worker["hasVae"],
+    "vaeReady": worker["vaeReady"],
     "modelPath": str(MODEL_PATH),
     "vaePath": str(VAE_PATH),
-    "modelType": SESSION.model_type if SESSION else None,
-    "vaeType": VAE_SESSION.model_type if VAE_SESSION else None,
+    "modelType": worker["modelType"],
+    "vaeType": worker["vaeType"],
     "liveTimestamp": current.timestamp,
-    "inputs": SESSION.inputs_meta if SESSION else [],
-    "outputs": SESSION.outputs_meta if SESSION else [],
-    "vaeInputs": VAE_SESSION.inputs_meta if VAE_SESSION else [],
-    "vaeOutputs": VAE_SESSION.outputs_meta if VAE_SESSION else [],
-    "vaeRuntime": vae_runtime,
+    "inputs": worker["inputs"],
+    "outputs": worker["outputs"],
+    "vaeInputs": worker["vaeInputs"],
+    "vaeOutputs": worker["vaeOutputs"],
+    "vaeRuntime": worker["lastVaeRuntime"],
+    "lastPolicyRunTime": worker["lastPolicyRunTime"],
+    "lastVaeRunTime": worker["lastVaeRunTime"],
+    "lastPolicyDurationMs": worker["lastPolicyDurationMs"],
+    "lastVaeDurationMs": worker["lastVaeDurationMs"],
+    "policyLoadTime": worker["policyLoadTime"],
+    "vaeLoadTime": worker["vaeLoadTime"],
+    "modelRevision": MODEL_REVISION,
+    "vaeRevision": VAE_REVISION,
+    "policyRunCount": worker["policyRunCount"],
+    "vaeRunCount": worker["vaeRunCount"],
+    "policyErrorCount": worker["policyErrorCount"],
+    "vaeErrorCount": worker["vaeErrorCount"],
+    "lastPolicyError": worker["lastPolicyError"],
+    "lastVaeError": worker["lastVaeError"],
+    "latestInference": latest,
     "lastSample": current.actual,
     "actual": current.actual if current else {},
-    "predicted": result["predicted"] if result else {},
-    "sessionError": SESSION_ERROR,
-    "vaeError": VAE_ERROR,
-    "inferenceError": inference_error,
-    "message": "model uploaded" if SESSION is not None else "waiting for model upload",
+    "predicted": latest.get("predicted", {}),
+    "sessionError": worker["lastPolicyError"],
+    "vaeError": worker["lastVaeError"],
+    "inferenceError": worker["lastPolicyError"],
+    "message": "inference running" if worker["running"] else ("inference stopped" if not worker["enabled"] else "waiting for successful inference"),
   }
 
 
 def _run_shadow() -> dict[str, Any]:
-  if SESSION is None:
-    raise RuntimeError("upload a model first")
-  return SESSION.run(LIVE_SAMPLER.current())
+  return _status()
 
 
 class ShadowHandler(SimpleHTTPRequestHandler):
@@ -570,50 +733,44 @@ class ShadowHandler(SimpleHTTPRequestHandler):
 
   def do_POST(self) -> None:
     if self.path == "/shadow/upload":
+      global MODEL_REVISION
       length = int(self.headers.get("Content-Length", "0"))
       body = self.rfile.read(length)
       _read_upload(body, MODEL_PATH)
-      try:
-        _load_uploaded_model()
-      except Exception as e:
-        cloudlog.exception("shadowmode model load failed: %s", e)
-        self._send_json({
-          "ok": False,
-          "error": str(e),
-          "modelPath": str(MODEL_PATH),
-          "status": _status(),
-        }, HTTPStatus.BAD_REQUEST)
-        return
+      MODEL_REVISION += 1
+      cloudlog.info("shadowmode policy upload received: bytes=%d revision=%d path=%s", len(body), MODEL_REVISION, MODEL_PATH)
       self._send_json({
         "ok": True,
-        "message": "model uploaded and loaded",
+        "message": "model uploaded; backend worker will load it",
         "bytes": len(body),
+        "modelRevision": MODEL_REVISION,
         "modelPath": str(MODEL_PATH),
         "status": _status(),
       })
       return
     if self.path == "/shadow/upload_vae":
+      global VAE_REVISION
       length = int(self.headers.get("Content-Length", "0"))
       body = self.rfile.read(length)
       _read_upload(body, VAE_PATH)
-      try:
-        _load_uploaded_vae()
-      except Exception as e:
-        cloudlog.exception("shadowmode vae load failed: %s", e)
-        self._send_json({
-          "ok": False,
-          "error": str(e),
-          "vaePath": str(VAE_PATH),
-          "status": _status(),
-        }, HTTPStatus.BAD_REQUEST)
-        return
+      VAE_REVISION += 1
+      cloudlog.info("shadowmode vae upload received: bytes=%d revision=%d path=%s", len(body), VAE_REVISION, VAE_PATH)
       self._send_json({
         "ok": True,
-        "message": "vae uploaded and loaded",
+        "message": "vae uploaded; backend worker will load it",
         "bytes": len(body),
+        "vaeRevision": VAE_REVISION,
         "vaePath": str(VAE_PATH),
         "status": _status(),
       })
+      return
+    if self.path == "/shadow/start":
+      INFERENCE_WORKER.start_inference()
+      self._send_json({"ok": True, "message": "inference started", "status": _status()})
+      return
+    if self.path == "/shadow/stop":
+      INFERENCE_WORKER.stop_inference()
+      self._send_json({"ok": True, "message": "inference stopped", "status": _status()})
       return
     self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
