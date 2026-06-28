@@ -39,14 +39,18 @@ except Exception:  # pragma: no cover
 
 try:
   import cereal.messaging as messaging
-except Exception:  # pragma: no cover
+  MESSAGING_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover
   messaging = None
+  MESSAGING_IMPORT_ERROR = str(e)
 
 try:
   from msgq.visionipc import VisionIpcClient, VisionStreamType
-except Exception:  # pragma: no cover
+  VISIONIPC_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover
   VisionIpcClient = None
   VisionStreamType = None
+  VISIONIPC_IMPORT_ERROR = str(e)
 
 
 def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
@@ -94,11 +98,50 @@ class LiveSampler(threading.Thread):
     self._last_steering_angle = 0.0
     self._last_steering_time = 0.0
     self._vipc_client = None
+    self._vipc_stream = None
+    self._available_streams: list[str] = []
+    self._last_error: str | None = None
+    self._last_stream_error: str | None = None
+    self._last_frame_time = 0.0
+    self._last_frame_id = -1
+    self._last_loop_time = 0.0
+    self._loop_count = 0
+    self._frame_count = 0
     self._latest = self._make_stub_sample()
 
   def current(self) -> LiveSample:
     with self._lock:
       return self._latest
+
+  def diagnostics(self) -> dict[str, Any]:
+    with self._lock:
+      sm_seen = {}
+      sm_updated = {}
+      if self._sm is not None:
+        sm_seen = {key: bool(self._sm.seen.get(key, False)) for key in ("carState", "roadCameraState", "carControl", "deviceState")}
+        sm_updated = {key: bool(self._sm.updated.get(key, False)) for key in ("carState", "roadCameraState", "carControl", "deviceState")}
+      return {
+        "messagingAvailable": messaging is not None,
+        "messagingImportError": MESSAGING_IMPORT_ERROR,
+        "visionIpcAvailable": VisionIpcClient is not None and VisionStreamType is not None,
+        "visionIpcImportError": VISIONIPC_IMPORT_ERROR,
+        "subMasterReady": self._sm is not None,
+        "availableStreams": list(self._available_streams),
+        "vipcConnected": self._vipc_client is not None,
+        "vipcStream": self._vipc_stream,
+        "vipcWidth": int(getattr(self._vipc_client, "width", 0) or 0) if self._vipc_client is not None else 0,
+        "vipcHeight": int(getattr(self._vipc_client, "height", 0) or 0) if self._vipc_client is not None else 0,
+        "vipcBufferLen": int(getattr(self._vipc_client, "buffer_len", 0) or 0) if self._vipc_client is not None else 0,
+        "lastFrameTime": self._last_frame_time,
+        "lastFrameId": self._last_frame_id,
+        "frameCount": self._frame_count,
+        "lastLoopTime": self._last_loop_time,
+        "loopCount": self._loop_count,
+        "lastError": self._last_error,
+        "lastStreamError": self._last_stream_error,
+        "seen": sm_seen,
+        "updated": sm_updated,
+      }
 
   def stop(self) -> None:
     self._stop.set()
@@ -109,19 +152,32 @@ class LiveSampler(threading.Thread):
 
   def _init_streams(self) -> None:
     if messaging is None:
+      self._last_stream_error = f"messaging unavailable: {MESSAGING_IMPORT_ERROR}"
       return
     if self._sm is None:
       self._sm = messaging.SubMaster(["carState", "roadCameraState", "liveCalibration", "deviceState", "carControl", "liveDelay"])
     if VisionIpcClient is None or VisionStreamType is None or self._vipc_client is not None:
+      if VisionIpcClient is None or VisionStreamType is None:
+        self._last_stream_error = f"VisionIPC unavailable: {VISIONIPC_IMPORT_ERROR}"
       return
     streams = VisionIpcClient.available_streams("camerad", block=False)
-    stream = VisionStreamType.VISION_STREAM_ROAD
-    if stream not in streams and hasattr(VisionStreamType, "VISION_STREAM_WIDE_ROAD"):
-      stream = VisionStreamType.VISION_STREAM_WIDE_ROAD
-    if stream in streams:
-      self._vipc_client = VisionIpcClient("camerad", stream, True)
-      if not self._vipc_client.connect(False):
-        self._vipc_client = None
+    self._available_streams = [str(stream) for stream in streams]
+    if not streams:
+      self._last_stream_error = "camerad has no available VisionIPC streams"
+      return
+    main_wide_camera = VisionStreamType.VISION_STREAM_ROAD not in streams
+    stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_ROAD
+    if stream not in streams:
+      self._last_stream_error = f"selected stream {stream} unavailable; streams={self._available_streams}"
+      return
+    client = VisionIpcClient("camerad", stream, True)
+    if client.connect(False):
+      self._vipc_client = client
+      self._vipc_stream = str(stream)
+      self._last_stream_error = None
+      cloudlog.info("shadowmode connected camera stream=%s size=%sx%s buffer_len=%s", self._vipc_stream, client.width, client.height, client.buffer_len)
+    else:
+      self._last_stream_error = f"connect failed stream={stream}"
 
   @staticmethod
   def _to_float(value: Any, default: float = 0.0) -> float:
@@ -176,7 +232,12 @@ class LiveSampler(threading.Thread):
       return None
     buf = self._vipc_client.recv()
     if buf is None:
+      self._last_stream_error = "VisionIPC recv returned no frame"
       return None
+    self._last_frame_time = time.time()
+    self._last_frame_id = int(getattr(self._vipc_client, "frame_id", -1))
+    self._frame_count += 1
+    self._last_stream_error = None
     uv_height = ((buf.height // 2) + 15) // 16 * 16
     uv_plane_size = buf.stride * uv_height
     y = np.array(buf.data[:buf.uv_offset], dtype=np.uint8).reshape((-1, buf.stride))[:buf.height, :buf.width]
@@ -201,8 +262,8 @@ class LiveSampler(threading.Thread):
 
   def _make_sample(self) -> LiveSample:
     now = time.time()
-    car_state = self._sm["carState"] if self._sm is not None and "carState" in self._sm else None
-    car_control = self._sm["carControl"] if self._sm is not None and "carControl" in self._sm else None
+    car_state = self._sm["carState"] if self._sm is not None else None
+    car_control = self._sm["carControl"] if self._sm is not None else None
     speed = self._clip(self._to_float(getattr(car_state, "vEgo", 0.0) if car_state is not None else 0.0) / 30.0, 0.0, 2.0)
     gas = self._clip(self._to_float(getattr(car_state, "gas", 0.0) if car_state is not None else 0.0), 0.0, 1.0)
     brake = self._clip(self._to_float(getattr(car_state, "brake", 0.0) if car_state is not None else 0.0), 0.0, 1.0)
@@ -234,6 +295,7 @@ class LiveSampler(threading.Thread):
         "command_accel": self._to_float(self._nested_attr(car_control, "actuators.accel", 0.0)),
         "command_torque": self._to_float(self._nested_attr(car_control, "actuators.torque", 0.0)),
         "source": "device" if self._sm is not None else "stub",
+        "has_live_rgb": image is not None,
       },
       timestamp=now,
     )
@@ -265,13 +327,17 @@ class LiveSampler(threading.Thread):
   def run(self) -> None:
     while not self._stop.is_set():
       try:
+        self._last_loop_time = time.time()
+        self._loop_count += 1
         self._init_streams()
         if self._sm is not None:
           self._sm.update(0)
           self._update_latest(self._make_sample())
         else:
           self._update_latest(self._make_stub_sample())
+        self._last_error = None
       except Exception as e:  # pragma: no cover
+        self._last_error = str(e)
         cloudlog.exception("shadowmode live sampler failed: %s", e)
       time.sleep(LIVE_REFRESH_S)
 
@@ -588,7 +654,7 @@ class ShadowInferenceWorker(threading.Thread):
     if self._vae_session is None:
       return sample, {"ran": False, "reason": "vae not loaded"}
     if sample.image is None:
-      return sample, {"ran": False, "reason": "no live rgb frame"}
+      return sample, {"ran": False, "reason": "no live rgb frame", "camera": LIVE_SAMPLER.diagnostics()}
     image_batch = sample.image.reshape((1, 96, 160, 3)).astype(np.uint8)
     outputs = self._vae_session.run_inputs({self._vae_input_name(): image_batch})
     latent = self._select_vae_latent(outputs)
@@ -697,6 +763,7 @@ def _read_upload(body: bytes, path: Path) -> None:
 def _status() -> dict[str, Any]:
   _ensure_inference_worker_started()
   current = LIVE_SAMPLER.current()
+  live_inputs = LIVE_SAMPLER.diagnostics()
   worker = INFERENCE_WORKER.snapshot()
   latest = worker.get("lastInference") or {}
   model_uploaded = MODEL_UPLOAD["revision"] > 0
@@ -738,6 +805,7 @@ def _status() -> dict[str, Any]:
     "modelType": worker["modelType"],
     "vaeType": worker["vaeType"],
     "liveTimestamp": current.timestamp,
+    "liveInputs": live_inputs,
     "inputs": worker["inputs"],
     "outputs": worker["outputs"],
     "vaeInputs": worker["vaeInputs"],
