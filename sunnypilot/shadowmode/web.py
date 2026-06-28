@@ -21,6 +21,7 @@ VAE_PATH = Path(tempfile.gettempdir()) / "shadowmode_vae.onnx"
 LIVE_REFRESH_S = 0.2
 UI_REFRESH_S = 1.0
 INFERENCE_REFRESH_S = 0.2
+LIVE_SAMPLER_STALE_S = 2.0
 STACK_SIZE = 51
 VAE_LATENT_DIM = 128
 CONTROL_HISTORY_DIM = 4
@@ -90,6 +91,7 @@ class LiveSampler(threading.Thread):
     super().__init__(name="shadowmode-live-sampler")
     self._lock = threading.Lock()
     self._stop = threading.Event()
+    self._started_once = False
     self._sm = None
     self._image_latents = deque(maxlen=STACK_SIZE)
     self._telemetry = deque(maxlen=STACK_SIZE)
@@ -137,6 +139,7 @@ class LiveSampler(threading.Thread):
         "frameCount": self._frame_count,
         "lastLoopTime": self._last_loop_time,
         "loopCount": self._loop_count,
+        "alive": self.is_alive(),
         "lastError": self._last_error,
         "lastStreamError": self._last_stream_error,
         "seen": sm_seen,
@@ -230,7 +233,7 @@ class LiveSampler(threading.Thread):
   def _read_camera_image(self) -> np.ndarray | None:
     if self._vipc_client is None:
       return None
-    buf = self._vipc_client.recv()
+    buf = self._vipc_client.recv(timeout_ms=0)
     if buf is None:
       self._last_stream_error = "VisionIPC recv returned no frame"
       return None
@@ -496,7 +499,27 @@ VAE_REVISION = 0
 MODEL_UPLOAD: dict[str, Any] = {"bytes": 0, "time": 0.0, "revision": 0}
 VAE_UPLOAD: dict[str, Any] = {"bytes": 0, "time": 0.0, "revision": 0}
 LIVE_SAMPLER = LiveSampler()
-LIVE_SAMPLER.start()
+
+
+def _ensure_live_sampler_started() -> None:
+  global LIVE_SAMPLER
+  diagnostics = LIVE_SAMPLER.diagnostics()
+  last_loop_time = float(diagnostics.get("lastLoopTime") or 0.0)
+  stale = last_loop_time > 0.0 and time.time() - last_loop_time > LIVE_SAMPLER_STALE_S
+  if LIVE_SAMPLER.is_alive() and not stale:
+    return
+  if stale:
+    cloudlog.error("shadowmode live sampler stale for %.1fs; creating replacement sampler", time.time() - last_loop_time)
+    LIVE_SAMPLER = LiveSampler()
+  elif LIVE_SAMPLER._started_once:
+    cloudlog.error("shadowmode live sampler was dead; creating replacement sampler")
+    LIVE_SAMPLER = LiveSampler()
+  LIVE_SAMPLER._started_once = True
+  LIVE_SAMPLER.start()
+  cloudlog.info("shadowmode live sampler thread started")
+
+
+_ensure_live_sampler_started()
 
 
 class ShadowInferenceWorker(threading.Thread):
@@ -651,6 +674,7 @@ class ShadowInferenceWorker(threading.Thread):
     return np.asarray(first, dtype=np.float32).reshape(-1)[-VAE_LATENT_DIM:]
 
   def _encode_live_image(self, sample: LiveSample) -> tuple[LiveSample, dict[str, Any]]:
+    _ensure_live_sampler_started()
     if self._vae_session is None:
       return sample, {"ran": False, "reason": "vae not loaded"}
     if sample.image is None:
@@ -761,9 +785,17 @@ def _read_upload(body: bytes, path: Path) -> None:
 
 
 def _status() -> dict[str, Any]:
+  _ensure_live_sampler_started()
   _ensure_inference_worker_started()
   current = LIVE_SAMPLER.current()
   live_inputs = LIVE_SAMPLER.diagnostics()
+  status_probe_streams = []
+  status_probe_error = None
+  if VisionIpcClient is not None:
+    try:
+      status_probe_streams = [str(stream) for stream in VisionIpcClient.available_streams("camerad", block=False)]
+    except Exception as e:
+      status_probe_error = str(e)
   worker = INFERENCE_WORKER.snapshot()
   latest = worker.get("lastInference") or {}
   model_uploaded = MODEL_UPLOAD["revision"] > 0
@@ -790,6 +822,10 @@ def _status() -> dict[str, Any]:
     "workerError": worker["workerError"],
     "workerHeartbeatTime": worker["workerHeartbeatTime"],
     "workerLoopCount": worker["workerLoopCount"],
+    "liveSamplerAlive": live_inputs["alive"],
+    "liveSamplerLoopCount": live_inputs["loopCount"],
+    "liveSamplerLastLoopTime": live_inputs["lastLoopTime"],
+    "liveSamplerLastError": live_inputs["lastError"],
     "hasModelFile": MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 0,
     "hasVaeFile": VAE_PATH.exists() and VAE_PATH.stat().st_size > 0,
     "policyState": policy_state,
@@ -806,6 +842,8 @@ def _status() -> dict[str, Any]:
     "vaeType": worker["vaeType"],
     "liveTimestamp": current.timestamp,
     "liveInputs": live_inputs,
+    "statusProbeAvailableStreams": status_probe_streams,
+    "statusProbeStreamError": status_probe_error,
     "inputs": worker["inputs"],
     "outputs": worker["outputs"],
     "vaeInputs": worker["vaeInputs"],
