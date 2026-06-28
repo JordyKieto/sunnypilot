@@ -1016,10 +1016,18 @@ class ShadowHandler(SimpleHTTPRequestHandler):
 
   def do_GET(self) -> None:
     if self.path == "/shadow/status":
-      self._send_json(_status())
+      try:
+        self._send_json(_status())
+      except Exception as e:
+        cloudlog.exception("shadowmode status failed: %s", e)
+        self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
       return
     if self.path == "/shadow/run":
-      self._send_json(_run_shadow())
+      try:
+        self._send_json(_run_shadow())
+      except Exception as e:
+        cloudlog.exception("shadowmode run failed: %s", e)
+        self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
       return
     if self.path == "/":
       self.path = "/index.html"
@@ -1077,11 +1085,15 @@ class ShadowHandler(SimpleHTTPRequestHandler):
     self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
 
+class ShadowHTTPServer(HTTPServer):
+  allow_reuse_address = True
+
+
 def main() -> None:
   _ensure_inference_worker_started()
   # Tinygrad's ONNX runner can keep SQLite state that is tied to the thread that
   # created it, so handle upload and inference requests on the same server thread.
-  server = HTTPServer(("0.0.0.0", 5051), ShadowHandler)
+  server = ShadowHTTPServer(("0.0.0.0", 5051), ShadowHandler)
   cloudlog.info("shadowmode listening on 0.0.0.0:5051")
   server.serve_forever()
 
