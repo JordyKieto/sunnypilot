@@ -26,6 +26,7 @@ INFERENCE_REFRESH_S = 0.2
 LIVE_SAMPLER_STALE_S = 2.0
 LIVE_FRAME_STALE_S = 2.0
 LIVE_MESSAGING_TIMEOUT_MS = 50
+LIVE_CAMERA_TIMEOUT_MS = 100
 STACK_SIZE = 51
 VAE_LATENT_DIM = 128
 CONTROL_HISTORY_DIM = 4
@@ -59,6 +60,17 @@ except Exception as e:  # pragma: no cover
 
 
 def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
+  if "policy_output" in outputs:
+    policy = np.asarray(outputs["policy_output"], dtype=np.float32).reshape(-1)
+    if policy.size >= 8:
+      outputs = {
+        "pedal_state_logits": policy[0:3],
+        "throttle_magnitude": policy[3:4],
+        "brake_magnitude": policy[4:5],
+        "steering": policy[5:6],
+        "vego": policy[6:7],
+        "delta_v": policy[7:8],
+      }
   decoded: dict[str, Any] = {}
   pedal_logits = outputs.get("pedal_state_logits")
   if pedal_logits is not None:
@@ -105,6 +117,7 @@ class LiveSampler(threading.Thread):
     self._last_steering_time = 0.0
     self._vipc_client = None
     self._vipc_stream = None
+    self._bad_vipc_streams: set[str] = set()
     self._available_streams: list[str] = []
     self._last_error: str | None = None
     self._last_stream_error: str | None = None
@@ -134,6 +147,7 @@ class LiveSampler(threading.Thread):
       sm_recv_frame = {}
       sm_log_mono_time = {}
       now = time.time()
+      now_mono = time.monotonic()
       if self._sm is not None:
         for key in ("carState", "roadCameraState", "carControl", "controlsState", "deviceState"):
           sm_seen[key] = bool(self._sm.seen.get(key, False))
@@ -141,7 +155,7 @@ class LiveSampler(threading.Thread):
           sm_alive[key] = bool(self._sm.alive.get(key, False))
           sm_valid[key] = bool(self._sm.valid.get(key, False))
           recv_time = float(self._sm.recv_time.get(key, 0.0) or 0.0)
-          sm_age[key] = now - recv_time if recv_time > 0.0 else None
+          sm_age[key] = now_mono - recv_time if recv_time > 0.0 else None
           sm_recv_frame[key] = int(self._sm.recv_frame.get(key, 0) or 0)
           sm_log_mono_time[key] = int(self._sm.logMonoTime.get(key, 0) or 0)
       last_frame_age = now - self._last_frame_time if self._last_frame_time > 0.0 else None
@@ -190,6 +204,8 @@ class LiveSampler(threading.Thread):
   def _drop_camera_client(self, reason: str) -> None:
     if self._vipc_client is None:
       return
+    if "no first frame" in reason and self._vipc_stream is not None:
+      self._bad_vipc_streams.add(str(self._vipc_stream))
     self._last_stream_reconnect_reason = reason
     self._last_stream_reconnect_time = time.time()
     self._stream_reconnect_count += 1
@@ -216,11 +232,19 @@ class LiveSampler(threading.Thread):
     if not streams:
       self._last_stream_error = "camerad has no available VisionIPC streams"
       return
-    main_wide_camera = VisionStreamType.VISION_STREAM_ROAD not in streams
-    stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_ROAD
-    if stream not in streams:
-      self._last_stream_error = f"selected stream {stream} unavailable; streams={self._available_streams}"
+    preferred = []
+    for stream in (VisionStreamType.VISION_STREAM_ROAD, VisionStreamType.VISION_STREAM_WIDE_ROAD):
+      if stream in streams:
+        preferred.append(stream)
+    ordered_streams = preferred + [stream for stream in streams if stream not in preferred]
+    candidates = [stream for stream in ordered_streams if str(stream) not in self._bad_vipc_streams]
+    if not candidates and ordered_streams:
+      self._bad_vipc_streams.clear()
+      candidates = ordered_streams
+    if not candidates:
+      self._last_stream_error = f"no usable camera stream; streams={self._available_streams}"
       return
+    stream = candidates[0]
     client = VisionIpcClient("camerad", stream, True)
     if client.connect(False):
       self._vipc_client = client
@@ -283,12 +307,17 @@ class LiveSampler(threading.Thread):
   def _read_camera_image(self) -> np.ndarray | None:
     if self._vipc_client is None:
       return None
-    buf = self._vipc_client.recv(timeout_ms=0)
+    buf = self._vipc_client.recv(timeout_ms=LIVE_CAMERA_TIMEOUT_MS)
     if buf is None:
       self._last_stream_error = "VisionIPC recv returned no frame"
-      if self._frame_is_stale(time.time()):
+      now = time.time()
+      if self._frame_is_stale(now):
         self._drop_camera_client(
-          f"no frame for {time.time() - self._last_frame_time:.1f}s"
+          f"no frame for {now - self._last_frame_time:.1f}s"
+        )
+      elif self._last_frame_time <= 0.0 and self._last_stream_connect_time > 0.0 and now - self._last_stream_connect_time > LIVE_FRAME_STALE_S:
+        self._drop_camera_client(
+          f"no first frame for {now - self._last_stream_connect_time:.1f}s"
         )
       return None
     self._last_frame_time = time.time()
@@ -319,6 +348,7 @@ class LiveSampler(threading.Thread):
 
   def _make_sample(self) -> LiveSample:
     now = time.time()
+    now_mono = time.monotonic()
     car_state = self._sm["carState"] if self._sm is not None else None
     car_control = self._sm["carControl"] if self._sm is not None else None
     car_state_age = None
@@ -328,7 +358,7 @@ class LiveSampler(threading.Thread):
     car_state_valid = False
     if self._sm is not None:
       recv_time = float(self._sm.recv_time.get("carState", 0.0) or 0.0)
-      car_state_age = now - recv_time if recv_time > 0.0 else None
+      car_state_age = now_mono - recv_time if recv_time > 0.0 else None
       car_state_seen = bool(self._sm.seen.get("carState", False))
       car_state_updated = bool(self._sm.updated.get("carState", False))
       car_state_alive = bool(self._sm.alive.get("carState", False))
@@ -825,6 +855,9 @@ class ShadowInferenceWorker(threading.Thread):
       )
 
     if self._session is None:
+      self._set_state(running=False, lastVaeRuntime=vae_runtime)
+      return
+    if self._vae_session is not None and not vae_runtime.get("ran"):
       self._set_state(running=False, lastVaeRuntime=vae_runtime)
       return
 
