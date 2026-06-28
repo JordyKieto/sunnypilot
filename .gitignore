@@ -95,3 +95,16 @@ SKILL.md
 !.idea/customTargets.xml
 !.idea/tools/*
 !.run/*
+
+# Drift
+.venv-irl-vae-export/
+.venv-irl-vae-export312/
+artifacts/
+irl_control_vae.py
+irl_sim_train.py
+irl_train.py
+irl_transition.py
+irl_vae.py
+policy_epoch_0050.keras
+scripts/upload_irl_dataset_to_s3.py
+sunnypilot/models/irl_policy_bolt_200.onnx

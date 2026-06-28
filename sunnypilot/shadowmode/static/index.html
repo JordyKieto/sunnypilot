@@ -27,11 +27,16 @@
     <main>
       <h1>Shadow Mode</h1>
       <p class="muted">Upload ONNX on the device. The backend runs inference. This page only displays decoded outputs and actuals.</p>
-      <p><span id="conn" class="pill">connecting...</span> <span id="runstate" class="pill">idle</span> <span id="fresh" class="pill">no sample yet</span></p>
+      <p><span id="conn" class="pill">connecting...</span> <span id="vaeState" class="pill">vae not loaded</span> <span id="runstate" class="pill">idle</span> <span id="fresh" class="pill">no sample yet</span></p>
 
       <section>
         <input id="model" type="file" accept=".onnx">
-        <button id="upload">Upload Model</button>
+        <button id="upload">Upload Policy Model</button>
+      </section>
+
+      <section>
+        <input id="vae" type="file" accept=".onnx">
+        <button id="uploadVae">Upload VAE Model</button>
       </section>
 
       <section>
@@ -67,6 +72,8 @@
         $("status").textContent = JSON.stringify(body, null, 2);
         $("conn").textContent = body.hasModel ? "model loaded" : "waiting for upload";
         $("conn").className = body.hasModel ? "pill ok" : "pill bad";
+        $("vaeState").textContent = body.hasVae ? "vae loaded" : "vae not loaded";
+        $("vaeState").className = body.hasVae ? "pill ok" : "pill";
         $("runstate").textContent = body.inferenceError ? "inference error" : (body.running ? "inference running" : "idle");
         $("runstate").className = body.inferenceError ? "pill bad" : (body.running ? "pill ok" : "pill");
         const age = body.liveTimestamp ? Math.max(0, (Date.now() / 1000) - body.liveTimestamp).toFixed(1) : null;
@@ -89,6 +96,22 @@
           $("status").textContent = JSON.stringify(e, null, 2);
           $("runstate").textContent = "upload failed";
           $("runstate").className = "pill bad";
+        }
+      });
+      $("uploadVae").addEventListener("click", async () => {
+        const file = $("vae").files[0];
+        if (!file) return;
+        const buf = await file.arrayBuffer();
+        $("status").textContent = "Uploading VAE...";
+        try {
+          const res = await fetch("/shadow/upload_vae", {method: "POST", body: buf});
+          const body = await res.json();
+          render(body.status || body);
+          if (!res.ok) throw body;
+        } catch (e) {
+          $("status").textContent = JSON.stringify(e, null, 2);
+          $("vaeState").textContent = "vae upload failed";
+          $("vaeState").className = "pill bad";
         }
       });
       async function refresh() {
