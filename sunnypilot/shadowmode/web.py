@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import mimetypes
 import tempfile
 import threading
 import time
@@ -663,6 +664,7 @@ class ShadowInferenceWorker(threading.Thread):
       "lastInference": None,
       "sessionLogPath": None,
       "sessionLogCount": 0,
+      "sessionLogRecent": [],
       "lastVaeRuntime": {"ran": False},
       "hasModel": False,
       "modelReady": False,
@@ -696,6 +698,7 @@ class ShadowInferenceWorker(threading.Thread):
       self._state["enabled"] = True
       self._state["sessionLogPath"] = str(log_path)
       self._state["sessionLogCount"] = 1
+      self._state["sessionLogRecent"] = []
     cloudlog.info("shadowmode inference started log=%s", log_path)
 
   def stop_inference(self) -> None:
@@ -732,6 +735,9 @@ class ShadowInferenceWorker(threading.Thread):
     with self._lock:
       self._log_count += 1
       self._state["sessionLogCount"] = self._log_count
+      recent = list(self._state.get("sessionLogRecent", []))
+      recent.append(row)
+      self._state["sessionLogRecent"] = recent[-25:]
 
   def _load_changed_models(self) -> None:
     global MODEL_REVISION, VAE_REVISION
@@ -1013,6 +1019,7 @@ def _status() -> dict[str, Any]:
     "vaeRunCount": worker["vaeRunCount"],
     "sessionLogPath": worker["sessionLogPath"],
     "sessionLogCount": worker["sessionLogCount"],
+    "sessionLogRecent": worker["sessionLogRecent"],
     "policyErrorCount": worker["policyErrorCount"],
     "vaeErrorCount": worker["vaeErrorCount"],
     "lastPolicyError": worker["lastPolicyError"],
@@ -1047,6 +1054,16 @@ class ShadowHandler(SimpleHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(data)
 
+  def _send_file(self, path: Path, download_name: str | None = None) -> None:
+    data = path.read_bytes()
+    self.send_response(HTTPStatus.OK)
+    self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+    self.send_header("Content-Length", str(len(data)))
+    if download_name:
+      self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+    self.end_headers()
+    self.wfile.write(data)
+
   def do_GET(self) -> None:
     if self.path == "/shadow/status":
       try:
@@ -1060,6 +1077,21 @@ class ShadowHandler(SimpleHTTPRequestHandler):
         self._send_json(_run_shadow())
       except Exception as e:
         cloudlog.exception("shadowmode run failed: %s", e)
+        self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+      return
+    if self.path == "/shadow/log":
+      try:
+        log_path = INFERENCE_WORKER.snapshot().get("sessionLogPath")
+        if not log_path:
+          self._send_json({"ok": False, "error": "no active session log"}, HTTPStatus.NOT_FOUND)
+          return
+        path = Path(log_path)
+        if not path.exists():
+          self._send_json({"ok": False, "error": "session log not found"}, HTTPStatus.NOT_FOUND)
+          return
+        self._send_file(path, download_name=path.name)
+      except Exception as e:
+        cloudlog.exception("shadowmode log download failed: %s", e)
         self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
       return
     if self.path == "/":

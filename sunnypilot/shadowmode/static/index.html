@@ -24,6 +24,14 @@
       pre { margin: 0; white-space: pre-wrap; }
       .muted { color: #66707a; }
       .small { font-size: 13px; line-height: 1.45; }
+      .table-wrap { overflow-x: auto; border: 1px solid #e2e7ee; border-radius: 10px; }
+      table { width: 100%; border-collapse: collapse; background: white; }
+      th, td { padding: 10px 12px; border-bottom: 1px solid #e8edf2; text-align: left; font-size: 13px; vertical-align: top; }
+      th { background: #f7f9fb; color: #5e6772; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+      tbody tr:nth-child(even) { background: #fbfcfd; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+      .truncate { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .session-log { margin-top: 8px; padding: 10px 12px; border: 1px solid #e2e7ee; border-radius: 8px; background: #fbfcfd; }
     </style>
   </head>
   <body>
@@ -48,20 +56,31 @@
         <div class="row">
           <button id="start" class="secondary">Start Backend Inference</button>
           <button id="stop" class="danger">Stop Backend Inference</button>
+          <button id="downloadLog">Download Full Log</button>
         </div>
         <p class="small muted" id="runtime">Backend inference is stopped.</p>
+        <div class="session-log small">
+          <div class="label">Session Log</div>
+          <div id="sessionLogPath" class="mono truncate">No session log yet.</div>
+        </div>
       </section>
 
       <section>
-        <div class="row">
-          <div class="card">
-            <div class="label">Actual</div>
-            <div class="value" id="actual">-</div>
-          </div>
-          <div class="card">
-            <div class="label">Predicted</div>
-            <div class="value" id="predicted">-</div>
-          </div>
+        <div class="label">Most Recent Predicted vs Actual</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Actual</th>
+                <th>Predicted</th>
+                <th>Match</th>
+              </tr>
+            </thead>
+            <tbody id="history">
+              <tr><td colspan="4" class="muted">No inference rows yet.</td></tr>
+            </tbody>
+          </table>
         </div>
       </section>
 
@@ -128,15 +147,41 @@
         const age = body.liveTimestamp ? Math.max(0, (Date.now() / 1000) - body.liveTimestamp).toFixed(1) : null;
         $("fresh").textContent = age == null ? "no sample yet" : `sample age ${age}s`;
         $("fresh").className = age != null && age < 2 ? "pill ok" : "pill bad";
-        $("actual").textContent = body.actual ? `speed ${body.actual.speed ?? 0}, throttle ${body.actual.throttle ?? 0}, brake ${body.actual.brake ?? 0}, steering ${body.actual.steering ?? 0}` : "-";
-        $("predicted").textContent = body.predicted ? `${body.predicted.pedal_state?.name || "-"} | throttle ${body.predicted.throttle ?? 0}, brake ${body.predicted.brake ?? 0}, steering ${body.predicted.steering ?? 0}` : "-";
         const policyAge = body.lastPolicyRunTime ? `${Math.max(0, (Date.now() / 1000) - body.lastPolicyRunTime).toFixed(1)}s ago` : "never";
         const vaeAge = body.lastVaeRunTime ? `${Math.max(0, (Date.now() / 1000) - body.lastVaeRunTime).toFixed(1)}s ago` : "never";
         const policyMs = Number(body.lastPolicyDurationMs || 0).toFixed(1);
         const vaeMs = Number(body.lastVaeDurationMs || 0).toFixed(1);
         $("runtime").textContent = `enabled=${!!body.inferenceEnabled}, running=${!!body.running}, policy runs=${body.policyRunCount ?? 0} (${policyAge}, ${policyMs}ms), vae runs=${body.vaeRunCount ?? 0} (${vaeAge}, ${vaeMs}ms), policy errors=${body.policyErrorCount ?? 0}, vae errors=${body.vaeErrorCount ?? 0}`;
+        const hasSessionLog = !!body.sessionLogPath;
+        $("sessionLogPath").textContent = hasSessionLog ? body.sessionLogPath : "No session log yet.";
+        $("downloadLog").disabled = !hasSessionLog;
+        $("downloadLog").className = hasSessionLog ? "" : "secondary";
         $("policyUploadState").textContent = describeUpload("Policy", body.policyState, body.modelUpload, body.policyLoadedRevision, body.policyFailedRevision, body.lastPolicyError);
         $("vaeUploadState").textContent = describeUpload("VAE", body.vaeState, body.vaeUpload, body.vaeLoadedRevision, body.vaeFailedRevision, body.lastVaeError);
+        const rows = Array.isArray(body.sessionLogRecent) ? body.sessionLogRecent : [];
+        const tbody = $("history");
+        if (!rows.length) {
+          tbody.innerHTML = '<tr><td colspan="4" class="muted">No inference rows yet.</td></tr>';
+        } else {
+          tbody.innerHTML = rows.slice().reverse().map((row) => {
+            const actual = row.actual || {};
+            const predicted = row.predicted || {};
+            const actualText = `speed ${actual.speed ?? 0}, throttle ${actual.throttle ?? 0}, brake ${actual.brake ?? 0}, steering ${actual.steering ?? 0}`;
+            const predictedText = `${predicted.pedal_state?.name || "-"} | throttle ${predicted.throttle ?? 0}, brake ${predicted.brake ?? 0}, steering ${predicted.steering ?? 0}`;
+            const match = [
+              Math.abs((actual.throttle ?? 0) - (predicted.throttle ?? 0)) < 0.15 ? "throttle" : null,
+              Math.abs((actual.brake ?? 0) - (predicted.brake ?? 0)) < 0.15 ? "brake" : null,
+              Math.abs((actual.steering ?? 0) - (predicted.steering ?? 0)) < 0.15 ? "steering" : null,
+            ].filter(Boolean).join(", ") || "none";
+            const t = row.time ? new Date(row.time * 1000).toLocaleTimeString() : "-";
+            return `<tr>
+              <td class="mono">${t}</td>
+              <td class="truncate">${actualText}</td>
+              <td class="truncate">${predictedText}</td>
+              <td>${match}</td>
+            </tr>`;
+          }).join("");
+        }
       }
       $("upload").addEventListener("click", async () => {
         const file = $("model").files[0];
@@ -194,6 +239,11 @@
           $("status").textContent = JSON.stringify(e, null, 2);
           $("runstate").textContent = "stop failed";
           $("runstate").className = "pill bad";
+        }
+      });
+      $("downloadLog").addEventListener("click", () => {
+        if (!$("downloadLog").disabled) {
+          window.location = "/shadow/log";
         }
       });
       async function refresh() {
