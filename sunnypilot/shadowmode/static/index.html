@@ -60,6 +60,7 @@
           <button id="start" class="secondary">Start Backend Inference</button>
           <button id="stop" class="danger">Stop Backend Inference</button>
           <button id="downloadLog">Download Full Log</button>
+          <button id="downloadActuatorLog">Download Actuator Log</button>
         </div>
         <div class="toggle-row">
           <label class="toggle">
@@ -72,6 +73,10 @@
         <div class="session-log small">
           <div class="label">Session Log</div>
           <div id="sessionLogPath" class="mono truncate">No session log yet.</div>
+        </div>
+        <div class="session-log small">
+          <div class="label">Actuator Log</div>
+          <div id="actuatorLogPath" class="mono truncate">No actuator log yet.</div>
         </div>
       </section>
 
@@ -154,14 +159,15 @@
         $("vaeState").className = body.vaeState === "loaded" ? "pill ok" : (body.vaeState === "load_failed" ? "pill bad" : "pill");
         $("runstate").textContent = body.lastPolicyError ? "inference error" : (body.running ? "backend running" : (body.inferenceEnabled ? "starting" : "stopped"));
         $("runstate").className = body.lastPolicyError ? "pill bad" : (body.running ? "pill ok" : "pill");
-        const actEnabled = !!body.shadowActuationEnabled;
+        const actAllowed = !!body.shadowActuationAllowed;
+        const actTransmitting = !!body.shadowActuationTransmitting;
         const actRequested = !!body.shadowActuationRequested;
         const actHardGate = !!body.shadowActuationHardGate;
-        const actReason = body.shadowActuationReason || (actEnabled ? "enabled" : "disabled");
+        const actReason = body.shadowActuationReason || (actTransmitting ? "transmitting" : "disabled");
         $("actuationToggle").checked = actRequested;
         $("actuationToggle").disabled = !body.running;
-        $("actuationState").textContent = actEnabled ? `enabled: ${actReason}` : `disabled: ${actReason}`;
-        $("actuationState").className = actEnabled ? "pill ok" : (actRequested ? "pill bad" : "pill");
+        $("actuationState").textContent = actTransmitting ? `transmitting: ${actReason}` : (actAllowed ? `allowed: ${actReason}` : `disabled: ${actReason}`);
+        $("actuationState").className = actTransmitting ? "pill ok" : (actRequested ? "pill bad" : "pill");
         const age = body.liveTimestamp ? Math.max(0, (Date.now() / 1000) - body.liveTimestamp).toFixed(1) : null;
         $("fresh").textContent = age == null ? "no sample yet" : `sample age ${age}s`;
         $("fresh").className = age != null && age < 2 ? "pill ok" : "pill bad";
@@ -170,11 +176,15 @@
         const policyMs = Number(body.lastPolicyDurationMs || 0).toFixed(1);
         const vaeMs = Number(body.lastVaeDurationMs || 0).toFixed(1);
         $("runtime").textContent = `enabled=${!!body.inferenceEnabled}, running=${!!body.running}, policy runs=${body.policyRunCount ?? 0} (${policyAge}, ${policyMs}ms), vae runs=${body.vaeRunCount ?? 0} (${vaeAge}, ${vaeMs}ms), policy errors=${body.policyErrorCount ?? 0}, vae errors=${body.vaeErrorCount ?? 0}`;
-        $("runtime").textContent += `, actuation requested=${actRequested}, enabled=${actEnabled}, hardGate=${actHardGate}`;
+        $("runtime").textContent += `, actuation requested=${actRequested}, allowed=${actAllowed}, transmitting=${actTransmitting}, hardGate=${actHardGate}`;
         const hasSessionLog = !!body.sessionLogPath;
         $("sessionLogPath").textContent = hasSessionLog ? body.sessionLogPath : "No session log yet.";
         $("downloadLog").disabled = !hasSessionLog;
         $("downloadLog").className = hasSessionLog ? "" : "secondary";
+        const hasActuatorLog = !!body.actuatorLogPath;
+        $("actuatorLogPath").textContent = hasActuatorLog ? `${body.actuatorLogPath} (${body.actuatorLogCount ?? 0} rows)` : "No actuator log yet.";
+        $("downloadActuatorLog").disabled = !hasActuatorLog;
+        $("downloadActuatorLog").className = hasActuatorLog ? "" : "secondary";
         $("policyUploadState").textContent = describeUpload("Policy", body.policyState, body.modelUpload, body.policyLoadedRevision, body.policyFailedRevision, body.lastPolicyError);
         $("vaeUploadState").textContent = describeUpload("VAE", body.vaeState, body.vaeUpload, body.vaeLoadedRevision, body.vaeFailedRevision, body.lastVaeError);
         const rows = Array.isArray(body.sessionLogRecent) ? body.sessionLogRecent : [];
@@ -184,7 +194,7 @@
         } else {
           tbody.innerHTML = rows.slice().reverse().map((row) => {
             const actual = row.actual || {};
-            const predicted = row.predicted || {};
+            const predicted = row.predictedGated || {};
             const actualText = `speed ${actual.speed ?? 0}, throttle ${actual.throttle ?? 0}, brake ${actual.brake ?? 0}, steering ${actual.steering ?? 0}`;
             const predictedText = `${predicted.pedal_state?.name || "-"} | throttle ${predicted.throttle ?? 0}, brake ${predicted.brake ?? 0}, steering ${predicted.steering ?? 0}`;
             const match = [
@@ -285,6 +295,11 @@
       $("downloadLog").addEventListener("click", () => {
         if (!$("downloadLog").disabled) {
           window.location = "/shadow/log";
+        }
+      });
+      $("downloadActuatorLog").addEventListener("click", () => {
+        if (!$("downloadActuatorLog").disabled) {
+          window.location = "/shadow/actuator_log";
         }
       });
       async function refresh() {

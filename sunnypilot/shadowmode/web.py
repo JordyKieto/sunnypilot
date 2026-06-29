@@ -46,11 +46,11 @@ CAN_BUS_LOOPBACK = 128
 CAN_ACCELERATOR_PEDAL = 0x1C4
 CAN_BRAKE_PEDAL = 0x0BE
 CAN_STEERING_ANGLE = 0x1E5
-CAN_LKA_STEERING_CMD = 0x180   # ASCMLKASteeringCmd
-CAN_PSCM_STATUS = 0x184        # PSCMStatus
-CAN_STEERING_BUTTON = 0x1E1    # ASCMSteeringButton
+CAN_LKA_STEERING_CMD = 0x180  # ASCMLKASteeringCmd
+CAN_PSCM_STATUS = 0x184  # PSCMStatus
+CAN_STEERING_BUTTON = 0x1E1  # ASCMSteeringButton
 CAN_SIGNAL_MAX_AGE_SECONDS = 0.05
-SHADOWMODE_ENABLE_ACTUATION = os.environ.get("SHADOWMODE_ENABLE_ACTUATION", "0") == "1"
+SHADOWMODE_ENABLE_ACTUATION = True
 # Derive lookup tables from actual Bolt EUV CarControllerParams (CAMERA_ACC_CAR):
 # MAX_GAS=1346, MAX_ACC_REGEN=-540, INACTIVE_REGEN=-500, max_regen_acceleration=0.
 _BOLT_EUV_CP = CarInterface.get_non_essential_params(CAR.CHEVROLET_BOLT_EUV)
@@ -63,10 +63,13 @@ GM_GAS_LOOKUP_V = tuple(float(x) for x in _BOLT_EUV_PARAMS.GAS_LOOKUP_V)
 GM_BRAKE_LOOKUP_BP = tuple(float(x) for x in _BOLT_EUV_PARAMS.BRAKE_LOOKUP_BP)
 GM_BRAKE_LOOKUP_V = tuple(float(x) for x in _BOLT_EUV_PARAMS.BRAKE_LOOKUP_V)
 
+if os.getenv("DEBUG") and not os.getenv("DEBUG").isdigit():
+  os.environ["DEBUG"] = "0"
+
 try:
-  import tinygrad.nn.onnx as tinygrad_onnx
+  from tinygrad.nn.onnx import OnnxRunner
 except Exception:  # pragma: no cover
-  tinygrad_onnx = None
+  OnnxRunner = None
 
 try:
   from tinygrad.tensor import Tensor
@@ -75,6 +78,7 @@ except Exception:  # pragma: no cover
 
 try:
   import cereal.messaging as messaging
+
   MESSAGING_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
   messaging = None
@@ -82,6 +86,7 @@ except Exception as e:  # pragma: no cover
 
 try:
   from msgq.visionipc import VisionIpcClient, VisionStreamType
+
   VISIONIPC_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
   VisionIpcClient = None
@@ -90,6 +95,7 @@ except Exception as e:  # pragma: no cover
 
 try:
   from selfdrive.pandad.pandad_api_impl import can_list_to_can_capnp
+
   CAN_CAPNP_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
   can_list_to_can_capnp = None
@@ -125,6 +131,36 @@ def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
   if "delta_v" in outputs:
     decoded["delta_v"] = float(np.asarray(outputs["delta_v"]).reshape(-1)[0])
   return decoded
+
+
+def _gate_longitudinal_controls(predicted: dict[str, Any]) -> dict[str, Any]:
+  gated = dict(predicted)
+  state = gated.get("pedal_state", {}).get("id")
+  throttle = gated.get("throttle")
+  brake = gated.get("brake")
+
+  if throttle is not None:
+    throttle = float(throttle)
+  if brake is not None:
+    brake = float(brake)
+
+  if state == 1:
+    if brake is not None:
+      brake = 0.0
+  elif state == 2:
+    if throttle is not None:
+      throttle = 0.0
+  elif state == 0:
+    if throttle is not None:
+      throttle = 0.0
+    if brake is not None:
+      brake = 0.0
+
+  if throttle is not None:
+    gated["throttle"] = throttle
+  if brake is not None:
+    gated["brake"] = brake
+  return gated
 
 
 def extract_motorola_signal(payload, start_bit, bit_length, signed=False):
@@ -185,9 +221,13 @@ def map_shadow_controls_to_gm_can(steering: float | None = None,
                                   throttle_magnitude: float | None = None,
                                   brake_magnitude: float | None = None) -> dict[str, Any]:
   mapped: dict[str, Any] = {
-    "enabled": False,
-    "actuation_allowed": False,
+    "previewed": False,
+    "requested": False,
+    "allowed": False,
+    "transmitting": False,
+    "canTransmit": False,
     "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION),
+    "source": "predictedGated",
   }
 
   if steering is not None:
@@ -236,6 +276,7 @@ def map_shadow_controls_to_gm_can(steering: float | None = None,
       },
     }
 
+  mapped["previewed"] = "steering" in mapped or "longitudinal" in mapped
   return mapped
 
 
@@ -300,9 +341,12 @@ _SHADOW_GM_CONTROLLER = _ShadowGMController()
 class LiveSample:
   image_latent: np.ndarray = field(default_factory=lambda: np.zeros((1, STACK_SIZE, VAE_LATENT_DIM), dtype=np.float32))
   telemetry: np.ndarray = field(default_factory=lambda: np.zeros((1, STACK_SIZE, 1), dtype=np.float32))
-  control_history: np.ndarray = field(default_factory=lambda: np.zeros((1, STACK_SIZE, CONTROL_HISTORY_DIM), dtype=np.float32))
+  control_history: np.ndarray = field(
+    default_factory=lambda: np.zeros((1, STACK_SIZE, CONTROL_HISTORY_DIM), dtype=np.float32))
   actual: dict[str, Any] = field(default_factory=dict)
-  actuator_map: dict[str, Any] = field(default_factory=dict)
+  gm_live_state: dict[str, Any] = field(default_factory=dict)
+  car_control: Any = None
+  car_state: Any = None
   image: np.ndarray | None = None
   timestamp: float = 0.0
 
@@ -362,9 +406,6 @@ class LiveSampler(threading.Thread):
     self._pt_lka_steering_cmd_counter = 0
     self._cam_lka_steering_cmd_counter = 0
     self._buttons_counter = 0
-    self._last_actuator_map: dict[str, Any] = {"enabled": False, "actuation_allowed": False}
-    self._actuation_requested = False
-    self._sendcan = messaging.pub_sock("sendcan") if (messaging is not None and SHADOWMODE_ENABLE_ACTUATION and can_list_to_can_capnp is not None) else None
     self._shadow_can_frame = 0
 
   def current(self) -> LiveSample:
@@ -495,7 +536,8 @@ class LiveSampler(threading.Thread):
       self._last_stream_error = f"messaging unavailable: {MESSAGING_IMPORT_ERROR}"
       return
     if self._sm is None:
-      services = ["carState", "roadCameraState", "liveCalibration", "deviceState", "carControl", "controlsState", "liveDelay"]
+      services = ["carState", "roadCameraState", "liveCalibration", "deviceState", "carControl", "controlsState",
+                  "liveDelay"]
       self._sm = messaging.SubMaster(services, poll="carState")
     if VisionIpcClient is None or VisionStreamType is None or self._vipc_client is not None:
       if VisionIpcClient is None or VisionStreamType is None:
@@ -526,7 +568,8 @@ class LiveSampler(threading.Thread):
       self._stream_connect_count += 1
       self._last_stream_connect_time = time.time()
       self._last_stream_error = None
-      cloudlog.info("shadowmode connected camera stream=%s size=%sx%s buffer_len=%s", self._vipc_stream, client.width, client.height, client.buffer_len)
+      cloudlog.info("shadowmode connected camera stream=%s size=%sx%s buffer_len=%s", self._vipc_stream, client.width,
+                    client.height, client.buffer_len)
     else:
       self._last_stream_error = f"connect failed stream={stream}"
 
@@ -572,7 +615,7 @@ class LiveSampler(threading.Thread):
     yuv = np.dstack((y, ul, vl)).astype(np.int16)
     yuv[:, :, 1:] -= 128
     matrix = np.array([
-      [1.00000,  1.00000, 1.00000],
+      [1.00000, 1.00000, 1.00000],
       [0.00000, -0.39465, 2.03211],
       [1.13983, -0.58060, 0.00000],
     ])
@@ -669,26 +712,6 @@ class LiveSampler(threading.Thread):
       "buttons_counter": self._buttons_counter,
     }
 
-    actuation_enabled = bool(self._actuation_requested and self._sendcan is not None)
-    self._last_actuator_map = map_shadow_controls_to_gm_can(steering=steering, throttle_magnitude=gas, brake_magnitude=brake)
-    self._last_actuator_map.update({
-      "requested": bool(self._actuation_requested),
-      "enabled": actuation_enabled,
-      "actuation_allowed": actuation_enabled,
-      "ui_enabled": bool(self._actuation_requested),
-      "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION),
-      "canTransmit": bool(self._sendcan is not None),
-      "reason": "enabled" if actuation_enabled else ("hard gate disabled" if not SHADOWMODE_ENABLE_ACTUATION else ("ui disabled" if not self._actuation_requested else "sendcan unavailable")),
-    })
-    if actuation_enabled:
-      can_msgs = _SHADOW_GM_CONTROLLER.build(
-        cc_cereal=car_control,
-        cs_live=cs_actual,
-        car_state_cereal=car_state,
-      )
-      if can_msgs:
-        self._sendcan.send(can_list_to_can_capnp(can_msgs, msgtype="sendcan"))
-
     image = self._read_camera_image()
     if image is not None:
       self._images.append(image)
@@ -721,14 +744,17 @@ class LiveSampler(threading.Thread):
         "car_state_alive": car_state_alive,
         "car_state_valid": car_state_valid,
         "car_state_age_seconds": car_state_age,
-        "powertrain_control_age_seconds": None if self._last_powertrain_control_time <= 0.0 else (now - self._last_powertrain_control_time),
+        "powertrain_control_age_seconds": None if self._last_powertrain_control_time <= 0.0 else (
+                  now - self._last_powertrain_control_time),
         "has_live_rgb": image is not None,
         "pscm_rolling_counter": live_pscm["RollingCounter"],
         "loopback_lka_updated": self._loopback_lka_steering_cmd_updated,
         "cam_lka_counter": self._cam_lka_steering_cmd_counter,
         "pt_lka_counter": self._pt_lka_steering_cmd_counter,
       },
-      actuator_map=self._last_actuator_map,
+      gm_live_state=cs_actual,
+      car_control=car_control,
+      car_state=car_state,
       timestamp=now,
     )
 
@@ -745,7 +771,9 @@ class LiveSampler(threading.Thread):
       control_history=control_history,
       actual={"speed": 0.0, "throttle": 0.0, "brake": 0.0, "steering": 0.0, "steering_torque": 0.0,
               "eps_torque": 0.0, "standstill": True, "source": "stub"},
-      actuator_map={"enabled": False, "actuation_allowed": False, "requested": False, "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION)},
+      gm_live_state={},
+      car_control=None,
+      car_state=None,
       image=None,
       timestamp=now,
     )
@@ -778,37 +806,14 @@ class LiveSampler(threading.Thread):
 
 class TinygradOnnxSession:
   def __init__(self, onnx_path: Path) -> None:
-    if tinygrad_onnx is None or Tensor is None:
+    if OnnxRunner is None or Tensor is None:
       raise RuntimeError("tinygrad is not available on this system")
     self.onnx_path = Path(onnx_path)
-    self.model = self._load_model(self.onnx_path)
+    self.model = OnnxRunner(str(self.onnx_path))
     self.model_type = type(self.model).__name__
     self.inputs_meta = self._read_meta("inputs")
     self.outputs_meta = self._read_meta("outputs")
     self.ready = True
-
-  def _load_model(self, onnx_path: Path) -> Any:
-    candidates = [
-      "load_onnx",
-      "build_onnx",
-      "OnnxRunner",
-      "ONNXRunner",
-      "Model",
-      "load",
-    ]
-    for name in candidates:
-      obj = getattr(tinygrad_onnx, name, None)
-      if obj is None:
-        continue
-      try:
-        if callable(obj):
-          try:
-            return obj(str(onnx_path))
-          except TypeError:
-            return obj(onnx_path)
-      except Exception:
-        continue
-    raise RuntimeError("No supported Tinygrad ONNX loader found in tinygrad.nn.onnx")
 
   def _read_meta(self, kind: str) -> list[dict[str, Any]]:
     meta: list[dict[str, Any]] = []
@@ -826,7 +831,8 @@ class TinygradOnnxSession:
         for idx, name in enumerate(expected):
           shape = []
           if idx < len(info):
-            shape = [int(d) if isinstance(d, int) and d > 0 else -1 for d in info[idx][1]] if len(info[idx]) > 1 else []
+            shape = [int(d) if isinstance(d, int) and d > 0 else -1 for d in info[idx][1]] if len(
+              info[idx]) > 1 else []
           meta.append({"name": name, "shape": shape})
     if not meta and kind == "inputs":
       meta.extend([
@@ -940,7 +946,8 @@ def _ensure_live_sampler_started() -> None:
   if LIVE_SAMPLER.is_alive() and not stale:
     return
   if stale:
-    cloudlog.error("shadowmode live sampler stale for %.1fs; creating replacement sampler", time.time() - last_loop_time)
+    cloudlog.error("shadowmode live sampler stale for %.1fs; creating replacement sampler",
+                   time.time() - last_loop_time)
     LIVE_SAMPLER = LiveSampler()
   elif LIVE_SAMPLER._started_once:
     cloudlog.error("shadowmode live sampler was dead; creating replacement sampler")
@@ -968,6 +975,10 @@ class ShadowInferenceWorker(threading.Thread):
     self._vae_session: TinygradOnnxSession | None = None
     self._log_path: Path | None = None
     self._log_count = 0
+    self._actuation_requested = False
+    self._sendcan = messaging.pub_sock("sendcan") if (
+      messaging is not None and SHADOWMODE_ENABLE_ACTUATION and can_list_to_can_capnp is not None
+    ) else None
     self._state: dict[str, Any] = {
       "enabled": False,
       "running": False,
@@ -994,6 +1005,9 @@ class ShadowInferenceWorker(threading.Thread):
       "sessionLogPath": None,
       "sessionLogCount": 0,
       "sessionLogRecent": [],
+      "actuatorLogPath": None,
+      "actuatorLogCount": 0,
+      "actuatorLogRecent": [],
       "lastVaeRuntime": {"ran": False},
       "hasModel": False,
       "modelReady": False,
@@ -1002,9 +1016,11 @@ class ShadowInferenceWorker(threading.Thread):
       "modelType": None,
       "vaeType": None,
       "shadowActuationRequested": False,
-      "shadowActuationEnabled": False,
+      "shadowActuationAllowed": False,
+      "shadowActuationTransmitting": False,
       "shadowActuationHardGate": bool(SHADOWMODE_ENABLE_ACTUATION),
       "shadowActuationReason": "ui disabled",
+      "lastActuatorMap": map_shadow_controls_to_gm_can(),
       "inputs": [],
       "outputs": [],
       "vaeInputs": [],
@@ -1014,6 +1030,7 @@ class ShadowInferenceWorker(threading.Thread):
   def start_inference(self) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / time.strftime("shadowmode_%Y%m%d_%H%M%S.jsonl")
+    actuator_log_path = LOG_DIR / time.strftime("shadowmode_actuator_%Y%m%d_%H%M%S.jsonl")
     metadata = {
       "type": "session_start",
       "time": time.time(),
@@ -1024,6 +1041,11 @@ class ShadowInferenceWorker(threading.Thread):
     }
     with log_path.open("w") as file:
       file.write(json.dumps(metadata, sort_keys=True) + "\n")
+    actuator_metadata = dict(metadata)
+    actuator_metadata["type"] = "actuator_session_start"
+    actuator_metadata["note"] = "Rows are written only while shadow actuation is requested."
+    with actuator_log_path.open("w") as file:
+      file.write(json.dumps(actuator_metadata, sort_keys=True) + "\n")
     with self._lock:
       self._enabled = True
       self._log_path = log_path
@@ -1032,13 +1054,19 @@ class ShadowInferenceWorker(threading.Thread):
       self._state["sessionLogPath"] = str(log_path)
       self._state["sessionLogCount"] = 1
       self._state["sessionLogRecent"] = []
-    cloudlog.info("shadowmode inference started log=%s", log_path)
+      self._state["actuatorLogPath"] = str(actuator_log_path)
+      self._state["actuatorLogCount"] = 1
+      self._state["actuatorLogRecent"] = []
+    cloudlog.info("shadowmode inference started log=%s actuator_log=%s", log_path, actuator_log_path)
 
   def stop_inference(self) -> None:
     with self._lock:
       self._enabled = False
       self._state["enabled"] = False
       self._state["running"] = False
+      self._state["shadowActuationAllowed"] = False
+      self._state["shadowActuationTransmitting"] = False
+      self._state["shadowActuationReason"] = "inference stopped"
     cloudlog.info("shadowmode inference stopped log=%s rows=%d", self._log_path, self._log_count)
 
   def snapshot(self) -> dict[str, Any]:
@@ -1048,6 +1076,7 @@ class ShadowInferenceWorker(threading.Thread):
   def set_actuation_requested(self, requested: bool) -> None:
     with self._lock:
       self._actuation_requested = bool(requested)
+      self._state["shadowActuationRequested"] = self._actuation_requested
 
   def actuation_requested(self) -> bool:
     with self._lock:
@@ -1065,7 +1094,9 @@ class ShadowInferenceWorker(threading.Thread):
     row = {
       "time": time.time(),
       "actual": result.get("actual", {}),
-      "predicted": result.get("predicted", {}),
+      "predictedRaw": result.get("predicted_raw", result.get("predicted", {})),
+      "predictedGated": result.get("predicted_gated", result.get("predicted", {})),
+      "actuatorMap": result.get("actuator_map", {}),
       "vaeRuntime": vae_runtime,
       "modelType": result.get("modelType"),
       "outputs": result.get("outputs", []),
@@ -1079,6 +1110,52 @@ class ShadowInferenceWorker(threading.Thread):
       recent = list(self._state.get("sessionLogRecent", []))
       recent.append(row)
       self._state["sessionLogRecent"] = recent[-25:]
+
+  @staticmethod
+  def _control_direction(value: Any, negative: str, positive: str, neutral: str, deadband: float = 0.01) -> str:
+    value = float(value or 0.0)
+    if value > deadband:
+      return positive
+    if value < -deadband:
+      return negative
+    return neutral
+
+  def _append_actuator_log(self, result: dict[str, Any]) -> None:
+    actuator_map = result.get("actuator_map", {})
+    if not actuator_map.get("requested"):
+      return
+    with self._lock:
+      log_path = self._state.get("actuatorLogPath")
+    if not log_path:
+      return
+
+    controls = result.get("predicted_gated", {})
+    throttle = float(controls.get("throttle", 0.0) or 0.0)
+    brake = float(controls.get("brake", 0.0) or 0.0)
+    steering = float(controls.get("steering", 0.0) or 0.0)
+    row = {
+      "time": time.time(),
+      "controls": {
+        "pedal_state": controls.get("pedal_state", {}),
+        "throttle": throttle,
+        "brake": brake,
+        "steering": steering,
+      },
+      "directions": {
+        "longitudinal": "throttle" if throttle > 0.01 else ("brake" if brake > 0.01 else "idle"),
+        "steering": self._control_direction(steering, "left", "right", "straight"),
+      },
+      "actuatorMap": actuator_map,
+      "actual": result.get("actual", {}),
+    }
+    path = Path(log_path)
+    with path.open("a") as file:
+      file.write(json.dumps(row, sort_keys=True) + "\n")
+    with self._lock:
+      self._state["actuatorLogCount"] = int(self._state.get("actuatorLogCount", 0)) + 1
+      recent = list(self._state.get("actuatorLogRecent", []))
+      recent.append(row)
+      self._state["actuatorLogRecent"] = recent[-25:]
 
   def _load_changed_models(self) -> None:
     global MODEL_REVISION, VAE_REVISION
@@ -1181,6 +1258,83 @@ class ShadowInferenceWorker(threading.Thread):
       "imageShape": list(image_batch.shape),
     }
 
+  @staticmethod
+  def _model_accel_request(predicted_gated: dict[str, Any]) -> float:
+    throttle = float(np.clip(predicted_gated.get("throttle", 0.0), 0.0, 1.0))
+    brake = float(np.clip(predicted_gated.get("brake", 0.0), 0.0, 1.0))
+    return float(np.clip(throttle - brake, GM_ACCEL_MIN, GM_ACCEL_MAX))
+
+  @staticmethod
+  def _model_car_control(base_control: Any, predicted_gated: dict[str, Any], active: bool) -> Any:
+    if base_control is not None and hasattr(base_control, "as_builder"):
+      cc = base_control.as_builder()
+    else:
+      cc = structs.CarControl.new_message()
+
+    steering = float(np.clip(predicted_gated.get("steering", 0.0), -1.0, 1.0))
+    accel = ShadowInferenceWorker._model_accel_request(predicted_gated)
+    long_state = structs.CarControl.Actuators.LongControlState
+
+    cc.enabled = bool(active)
+    cc.latActive = bool(active)
+    cc.longActive = bool(active)
+    cc.actuators.torque = steering
+    cc.actuators.accel = accel
+    cc.actuators.longControlState = long_state.stopping if accel < -0.01 else long_state.pid
+    return cc
+
+  def _actuator_reason(self, requested: bool, allowed: bool, previewed: bool, live_ready: bool) -> str:
+    if allowed:
+      return "allowed"
+    if not previewed:
+      return "no gated prediction"
+    if not SHADOWMODE_ENABLE_ACTUATION:
+      return "hard gate disabled"
+    if not requested:
+      return "ui disabled"
+    if self._sendcan is None:
+      return "sendcan unavailable"
+    if not live_ready:
+      return "live control unavailable"
+    return "not allowed"
+
+  def _build_actuator_map(self, sample: LiveSample, predicted_gated: dict[str, Any]) -> dict[str, Any]:
+    requested = self.actuation_requested()
+    actuator_map = map_shadow_controls_to_gm_can(
+      steering=predicted_gated.get("steering"),
+      throttle_magnitude=predicted_gated.get("throttle"),
+      brake_magnitude=predicted_gated.get("brake"),
+    )
+    previewed = bool(actuator_map.get("previewed"))
+    can_transmit = bool(self._sendcan is not None and can_list_to_can_capnp is not None)
+    live_ready = bool(sample.car_control is not None and sample.car_state is not None and sample.gm_live_state)
+    allowed = bool(requested and SHADOWMODE_ENABLE_ACTUATION and can_transmit and previewed and live_ready)
+    can_msgs = []
+
+    if allowed:
+      model_cc = self._model_car_control(sample.car_control, predicted_gated, active=True)
+      can_msgs = _SHADOW_GM_CONTROLLER.build(
+        cc_cereal=model_cc,
+        cs_live=sample.gm_live_state,
+        car_state_cereal=sample.car_state,
+      )
+      if can_msgs:
+        self._sendcan.send(can_list_to_can_capnp(can_msgs, msgtype="sendcan"))
+
+    transmitting = bool(allowed and can_msgs)
+    actuator_map.update({
+      "previewed": previewed,
+      "requested": requested,
+      "allowed": allowed,
+      "transmitting": transmitting,
+      "canTransmit": can_transmit,
+      "liveReady": live_ready,
+      "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION),
+      "reason": "transmitting" if transmitting else self._actuator_reason(requested, allowed, previewed, live_ready),
+      "canMessageCount": len(can_msgs),
+    })
+    return actuator_map
+
   def _run_once(self) -> None:
     sample = LIVE_SAMPLER.current()
     vae_runtime = {"ran": False}
@@ -1202,24 +1356,59 @@ class ShadowInferenceWorker(threading.Thread):
       )
 
     if self._session is None:
-      self._set_state(running=False, lastVaeRuntime=vae_runtime)
+      self._set_state(
+        running=False,
+        lastVaeRuntime=vae_runtime,
+        shadowActuationAllowed=False,
+        shadowActuationTransmitting=False,
+        shadowActuationReason="policy not loaded",
+      )
       return
     if self._vae_session is not None and not vae_runtime.get("ran"):
-      self._set_state(running=False, lastVaeRuntime=vae_runtime)
+      self._set_state(
+        running=False,
+        lastVaeRuntime=vae_runtime,
+        shadowActuationAllowed=False,
+        shadowActuationTransmitting=False,
+        shadowActuationReason="vae not ready",
+      )
       return
 
     try:
       policy_start = time.monotonic()
       result = self._session.run(sample)
+      predicted_raw = result.get("predicted", {})
+      predicted_gated = _gate_longitudinal_controls(predicted_raw)
+      result["predicted_raw"] = predicted_raw
+      result["predicted_gated"] = predicted_gated
+      actuator_map = self._build_actuator_map(sample, predicted_gated)
+      result["actuator_map"] = actuator_map
       now = time.time()
       self._append_session_log(result, vae_runtime)
+      self._append_actuator_log(result)
       self._set_state(
         running=True,
         lastPolicyRunTime=now,
         lastPolicyDurationMs=(time.monotonic() - policy_start) * 1000.0,
         policyRunCount=self._state.get("policyRunCount", 0) + 1,
         lastPolicyError=None,
-        lastInference=result,
+        lastInference={
+          "ok": result.get("ok", False),
+          "modelType": result.get("modelType"),
+          "actual": result.get("actual", {}),
+          "predictedRaw": predicted_raw,
+          "predictedGated": predicted_gated,
+          "actuatorMap": actuator_map,
+          "outputs": result.get("outputs", []),
+          "callMode": result.get("callMode"),
+          "inputOrder": result.get("inputOrder", []),
+          "inputShapes": result.get("inputShapes", []),
+        },
+        lastActuatorMap=actuator_map,
+        shadowActuationRequested=bool(actuator_map.get("requested")),
+        shadowActuationAllowed=bool(actuator_map.get("allowed")),
+        shadowActuationTransmitting=bool(actuator_map.get("transmitting")),
+        shadowActuationReason=str(actuator_map.get("reason", "")),
         lastVaeRuntime=vae_runtime,
       )
     except Exception as e:
@@ -1228,6 +1417,9 @@ class ShadowInferenceWorker(threading.Thread):
         lastPolicyError=str(e),
         policyErrorCount=self._state.get("policyErrorCount", 0) + 1,
         lastVaeRuntime=vae_runtime,
+        shadowActuationAllowed=False,
+        shadowActuationTransmitting=False,
+        shadowActuationReason="policy inference failed",
       )
       cloudlog.exception("shadowmode policy inference failed: %s", e)
 
@@ -1240,7 +1432,12 @@ class ShadowInferenceWorker(threading.Thread):
         if enabled:
           self._run_once()
         else:
-          self._set_state(running=False)
+          self._set_state(
+            running=False,
+            shadowActuationAllowed=False,
+            shadowActuationTransmitting=False,
+            shadowActuationReason="inference stopped",
+          )
         self._set_state(
           workerError=None,
           workerHeartbeatTime=time.time(),
@@ -1252,6 +1449,9 @@ class ShadowInferenceWorker(threading.Thread):
           workerError=str(e),
           workerHeartbeatTime=time.time(),
           workerLoopCount=self._state.get("workerLoopCount", 0) + 1,
+          shadowActuationAllowed=False,
+          shadowActuationTransmitting=False,
+          shadowActuationReason="worker error",
         )
         cloudlog.exception("shadowmode inference worker loop failed: %s", e)
       time.sleep(INFERENCE_REFRESH_S)
@@ -1268,7 +1468,9 @@ def _ensure_inference_worker_started() -> None:
     cloudlog.error("shadowmode inference worker was dead; creating replacement worker")
     replacement = ShadowInferenceWorker()
     replacement._enabled = INFERENCE_WORKER.snapshot().get("enabled", False)
+    replacement._actuation_requested = INFERENCE_WORKER.actuation_requested()
     replacement._state["enabled"] = replacement._enabled
+    replacement._state["shadowActuationRequested"] = replacement._actuation_requested
     INFERENCE_WORKER = replacement
   INFERENCE_WORKER._started_once = True
   INFERENCE_WORKER.start()
@@ -1293,13 +1495,11 @@ def _status() -> dict[str, Any]:
       status_probe_error = str(e)
   worker = INFERENCE_WORKER.snapshot()
   latest = worker.get("lastInference") or {}
-  actuation_requested = INFERENCE_WORKER.actuation_requested()
-  actuation_enabled = bool(actuation_requested and SHADOWMODE_ENABLE_ACTUATION and worker["running"] and worker["enabled"])
-  actuation_reason = "enabled" if actuation_enabled else (
-    "hard gate disabled" if not SHADOWMODE_ENABLE_ACTUATION else (
-      "inference not running" if not worker["running"] else ("ui disabled" if not actuation_requested else "waiting for sendcan")
-    )
-  )
+  actuator_map = worker.get("lastActuatorMap", {})
+  actuation_requested = bool(worker.get("shadowActuationRequested", False))
+  actuation_allowed = bool(worker.get("shadowActuationAllowed", False))
+  actuation_transmitting = bool(worker.get("shadowActuationTransmitting", False))
+  actuation_reason = worker.get("shadowActuationReason") or actuator_map.get("reason") or "ui disabled"
   model_uploaded = MODEL_UPLOAD["revision"] > 0
   vae_uploaded = VAE_UPLOAD["revision"] > 0
   policy_loaded_revision = worker["policyLoadedRevision"]
@@ -1343,7 +1543,8 @@ def _status() -> dict[str, Any]:
     "modelType": worker["modelType"],
     "vaeType": worker["vaeType"],
     "shadowActuationRequested": actuation_requested,
-    "shadowActuationEnabled": actuation_enabled,
+    "shadowActuationAllowed": actuation_allowed,
+    "shadowActuationTransmitting": actuation_transmitting,
     "shadowActuationHardGate": bool(SHADOWMODE_ENABLE_ACTUATION),
     "shadowActuationReason": actuation_reason,
     "liveTimestamp": current.timestamp,
@@ -1372,6 +1573,9 @@ def _status() -> dict[str, Any]:
     "sessionLogPath": worker["sessionLogPath"],
     "sessionLogCount": worker["sessionLogCount"],
     "sessionLogRecent": worker["sessionLogRecent"],
+    "actuatorLogPath": worker["actuatorLogPath"],
+    "actuatorLogCount": worker["actuatorLogCount"],
+    "actuatorLogRecent": worker["actuatorLogRecent"],
     "policyErrorCount": worker["policyErrorCount"],
     "vaeErrorCount": worker["vaeErrorCount"],
     "lastPolicyError": worker["lastPolicyError"],
@@ -1379,12 +1583,14 @@ def _status() -> dict[str, Any]:
     "latestInference": latest,
     "lastSample": current.actual,
     "actual": current.actual if current else {},
-    "actuatorMap": current.actuator_map if current else {},
-    "predicted": latest.get("predicted", {}),
+    "actuatorMap": actuator_map,
+    "predictedRaw": latest.get("predictedRaw", {}),
+    "predictedGated": latest.get("predictedGated", {}),
     "sessionError": worker["lastPolicyError"],
     "vaeError": worker["lastVaeError"],
     "inferenceError": worker["lastPolicyError"],
-    "message": "inference running" if worker["running"] else ("inference stopped" if not worker["enabled"] else "waiting for successful inference"),
+    "message": "inference running" if worker["running"] else (
+      "inference stopped" if not worker["enabled"] else "waiting for successful inference"),
   }
 
 
@@ -1447,6 +1653,21 @@ class ShadowHandler(SimpleHTTPRequestHandler):
         cloudlog.exception("shadowmode log download failed: %s", e)
         self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
       return
+    if self.path == "/shadow/actuator_log":
+      try:
+        log_path = INFERENCE_WORKER.snapshot().get("actuatorLogPath")
+        if not log_path:
+          self._send_json({"ok": False, "error": "no active actuator log"}, HTTPStatus.NOT_FOUND)
+          return
+        path = Path(log_path)
+        if not path.exists():
+          self._send_json({"ok": False, "error": "actuator log not found"}, HTTPStatus.NOT_FOUND)
+          return
+        self._send_file(path, download_name=path.name)
+      except Exception as e:
+        cloudlog.exception("shadowmode actuator log download failed: %s", e)
+        self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+      return
     if self.path == "/":
       self.path = "/index.html"
     super().do_GET()
@@ -1460,7 +1681,8 @@ class ShadowHandler(SimpleHTTPRequestHandler):
       _read_upload(body, MODEL_PATH)
       MODEL_REVISION += 1
       MODEL_UPLOAD = {"bytes": len(body), "time": time.time(), "revision": MODEL_REVISION}
-      cloudlog.info("shadowmode policy upload received: bytes=%d revision=%d path=%s", len(body), MODEL_REVISION, MODEL_PATH)
+      cloudlog.info("shadowmode policy upload received: bytes=%d revision=%d path=%s", len(body), MODEL_REVISION,
+                    MODEL_PATH)
       self._send_json({
         "ok": True,
         "message": "policy uploaded; backend worker is loading it",
