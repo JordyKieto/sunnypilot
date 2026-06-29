@@ -32,6 +32,9 @@
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
       .truncate { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .session-log { margin-top: 8px; padding: 10px 12px; border: 1px solid #e2e7ee; border-radius: 8px; background: #fbfcfd; }
+      .toggle-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+      .toggle { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; }
+      .toggle input { width: 18px; height: 18px; }
     </style>
   </head>
   <body>
@@ -57,6 +60,13 @@
           <button id="start" class="secondary">Start Backend Inference</button>
           <button id="stop" class="danger">Stop Backend Inference</button>
           <button id="downloadLog">Download Full Log</button>
+        </div>
+        <div class="toggle-row">
+          <label class="toggle">
+            <input id="actuationToggle" type="checkbox">
+            <span>Enable Shadow Actuation</span>
+          </label>
+          <span id="actuationState" class="pill">actuation disabled</span>
         </div>
         <p class="small muted" id="runtime">Backend inference is stopped.</p>
         <div class="session-log small">
@@ -144,6 +154,14 @@
         $("vaeState").className = body.vaeState === "loaded" ? "pill ok" : (body.vaeState === "load_failed" ? "pill bad" : "pill");
         $("runstate").textContent = body.lastPolicyError ? "inference error" : (body.running ? "backend running" : (body.inferenceEnabled ? "starting" : "stopped"));
         $("runstate").className = body.lastPolicyError ? "pill bad" : (body.running ? "pill ok" : "pill");
+        const actEnabled = !!body.shadowActuationEnabled;
+        const actRequested = !!body.shadowActuationRequested;
+        const actHardGate = !!body.shadowActuationHardGate;
+        const actReason = body.shadowActuationReason || (actEnabled ? "enabled" : "disabled");
+        $("actuationToggle").checked = actRequested;
+        $("actuationToggle").disabled = !body.running;
+        $("actuationState").textContent = actEnabled ? `enabled: ${actReason}` : `disabled: ${actReason}`;
+        $("actuationState").className = actEnabled ? "pill ok" : (actRequested ? "pill bad" : "pill");
         const age = body.liveTimestamp ? Math.max(0, (Date.now() / 1000) - body.liveTimestamp).toFixed(1) : null;
         $("fresh").textContent = age == null ? "no sample yet" : `sample age ${age}s`;
         $("fresh").className = age != null && age < 2 ? "pill ok" : "pill bad";
@@ -152,6 +170,7 @@
         const policyMs = Number(body.lastPolicyDurationMs || 0).toFixed(1);
         const vaeMs = Number(body.lastVaeDurationMs || 0).toFixed(1);
         $("runtime").textContent = `enabled=${!!body.inferenceEnabled}, running=${!!body.running}, policy runs=${body.policyRunCount ?? 0} (${policyAge}, ${policyMs}ms), vae runs=${body.vaeRunCount ?? 0} (${vaeAge}, ${vaeMs}ms), policy errors=${body.policyErrorCount ?? 0}, vae errors=${body.vaeErrorCount ?? 0}`;
+        $("runtime").textContent += `, actuation requested=${actRequested}, enabled=${actEnabled}, hardGate=${actHardGate}`;
         const hasSessionLog = !!body.sessionLogPath;
         $("sessionLogPath").textContent = hasSessionLog ? body.sessionLogPath : "No session log yet.";
         $("downloadLog").disabled = !hasSessionLog;
@@ -239,6 +258,28 @@
           $("status").textContent = JSON.stringify(e, null, 2);
           $("runstate").textContent = "stop failed";
           $("runstate").className = "pill bad";
+        }
+      });
+      $("actuationToggle").addEventListener("change", async () => {
+        const enabled = $("actuationToggle").checked;
+        if (!enabled && !confirm("Disable shadow actuation?")) {
+          $("actuationToggle").checked = true;
+          return;
+        }
+        if (enabled && !$("runstate").textContent.includes("backend running")) {
+          $("actuationToggle").checked = false;
+          return;
+        }
+        $("status").textContent = enabled ? "Enabling shadow actuation..." : "Disabling shadow actuation...";
+        try {
+          const body = await request("/shadow/actuation", {
+            method: "POST",
+            body: JSON.stringify({enabled}),
+          });
+          render(body.status || body);
+        } catch (e) {
+          $("status").textContent = JSON.stringify(e, null, 2);
+          $("actuationToggle").checked = !enabled;
         }
       });
       $("downloadLog").addEventListener("click", () => {

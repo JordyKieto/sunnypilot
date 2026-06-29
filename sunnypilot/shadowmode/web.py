@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import mimetypes
+import os
 import tempfile
 import threading
 import time
@@ -15,6 +16,11 @@ import numpy as np
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.swaglog import cloudlog
+from opendbc.car import structs
+from opendbc.car.gm.carcontroller import CarController
+from opendbc.car.gm.interface import CarInterface
+from opendbc.car.gm.values import CAR
+from opendbc.sunnypilot.car.gm.values_ext import GMFlagsSP
 
 STATIC_DIR = Path(BASEDIR) / "sunnypilot" / "shadowmode" / "static"
 MODEL_PATH = Path(tempfile.gettempdir()) / "shadowmode_model.onnx"
@@ -38,6 +44,14 @@ CAN_ACCELERATOR_PEDAL = 0x1C4
 CAN_BRAKE_PEDAL = 0x0BE
 CAN_STEERING_ANGLE = 0x1E5
 CAN_SIGNAL_MAX_AGE_SECONDS = 0.05
+SHADOWMODE_ENABLE_ACTUATION = os.environ.get("SHADOWMODE_ENABLE_ACTUATION", "0") == "1"
+GM_STEER_MAX = 300.0
+GM_ACCEL_MIN = -4.0
+GM_ACCEL_MAX = 2.0
+GM_GAS_LOOKUP_BP = (-0.1, 0.0, GM_ACCEL_MAX)
+GM_GAS_LOOKUP_V = (-650.0, 0.0, 1018.0)
+GM_BRAKE_LOOKUP_BP = (GM_ACCEL_MIN, -0.1)
+GM_BRAKE_LOOKUP_V = (400.0, 0.0)
 
 try:
   import tinygrad.nn.onnx as tinygrad_onnx
@@ -63,6 +77,13 @@ except Exception as e:  # pragma: no cover
   VisionIpcClient = None
   VisionStreamType = None
   VISIONIPC_IMPORT_ERROR = str(e)
+
+try:
+  from selfdrive.pandad.pandad_api_impl import can_list_to_can_capnp
+  CAN_CAPNP_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover
+  can_list_to_can_capnp = None
+  CAN_CAPNP_IMPORT_ERROR = str(e)
 
 
 def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
@@ -127,12 +148,140 @@ def decode_powertrain_control_frame(address, payload):
   return {}
 
 
+def map_shadow_controls_to_gm_can(steering: float | None = None,
+                                  throttle_magnitude: float | None = None,
+                                  brake_magnitude: float | None = None) -> dict[str, Any]:
+  mapped: dict[str, Any] = {
+    "enabled": False,
+    "actuation_allowed": False,
+    "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION),
+  }
+
+  if steering is not None:
+    steering_norm = float(np.clip(steering, -1.0, 1.0))
+    steering_torque = steering_norm * GM_STEER_MAX
+    mapped["steering"] = {
+      "input_norm": steering_norm,
+      "requested_torque": steering_torque,
+      "gm_can": {
+        "name": "ASCMLKASteeringCmd",
+        "bus": 0,
+        "fields": {
+          "LKASteeringCmdActive": int(SHADOWMODE_ENABLE_ACTUATION),
+          "LKASteeringCmd": int(round(steering_torque)),
+        },
+      },
+    }
+
+  if throttle_magnitude is not None or brake_magnitude is not None:
+    throttle = float(np.clip(throttle_magnitude if throttle_magnitude is not None else 0.0, 0.0, 1.0))
+    brake = float(np.clip(brake_magnitude if brake_magnitude is not None else 0.0, 0.0, 1.0))
+    accel_request = float(np.clip(throttle - brake, GM_ACCEL_MIN, GM_ACCEL_MAX))
+    gas_cmd = float(np.interp(accel_request, GM_GAS_LOOKUP_BP, GM_GAS_LOOKUP_V))
+    brake_cmd = float(np.interp(accel_request, GM_BRAKE_LOOKUP_BP, GM_BRAKE_LOOKUP_V))
+    mapped["longitudinal"] = {
+      "throttle_magnitude": throttle,
+      "brake_magnitude": brake,
+      "requested_accel": accel_request,
+      "gm_can": {
+        "gas_regen": {
+          "name": "ASCMGasRegenCmd",
+          "bus": 0,
+          "fields": {
+            "GasRegenCmdActive": int(SHADOWMODE_ENABLE_ACTUATION),
+            "GasRegenCmd": gas_cmd,
+          },
+        },
+        "friction_brake": {
+          "name": "EBCMFrictionBrakeCmd",
+          "bus": 1,
+          "fields": {
+            "FrictionBrakeMode": 0x1,
+            "FrictionBrakeCmd": -brake_cmd,
+          },
+        },
+      },
+    }
+
+  return mapped
+
+
+class _ShadowGMController:
+  def __init__(self) -> None:
+    cp = CarInterface.get_non_essential_params(CAR.CHEVROLET_BOLT_EUV)
+    cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.CHEVROLET_BOLT_EUV)
+    cp_sp.flags |= int(GMFlagsSP.NON_ACC)
+    cp.openpilotLongitudinalControl = True
+    self.cp = cp
+    self.cp_sp = cp_sp
+    self.controller = CarController({}, cp, cp_sp)
+    self.frame = 0
+
+  @staticmethod
+  def _make_cc(steering: float, throttle_magnitude: float, brake_magnitude: float, actual: dict[str, Any] | None = None):
+    cc = structs.CarControl.new_message()
+    cc.enabled = True
+    cc.latActive = True
+    cc.longActive = True
+    cc.cruiseControl.cancel = False
+    cc.actuators.torque = float(np.clip(steering, -1.0, 1.0))
+    cc.actuators.accel = float(np.clip(throttle_magnitude - brake_magnitude, GM_ACCEL_MIN, GM_ACCEL_MAX))
+    cc.actuators.gas = float(np.clip(throttle_magnitude, 0.0, 1.0))
+    cc.actuators.brake = float(np.clip(brake_magnitude, 0.0, 1.0))
+    cc.actuators.longControlState = structs.CarControl.Actuators.LongControlState.stopping if cc.actuators.accel <= 0.0 else structs.CarControl.Actuators.LongControlState.pid
+    cc.hudControl.visualAlert = structs.CarControl.HUDControl.VisualAlert.none
+    cc.hudControl.setSpeed = float(actual.get("cruise_speed", 0.0) if actual else 0.0)
+    cc.hudControl.leadDistanceBars = int(actual.get("lead_distance_bars", 0) if actual else 0)
+    cc.hudControl.leadVisible = bool(actual.get("lead_visible", False) if actual else False)
+    return cc
+
+  @staticmethod
+  def _make_cs(actual: dict[str, Any] | None = None):
+    actual = actual or {}
+    v_ego = float(actual.get("speed", 0.0) or 0.0)
+    out = type("Out", (), {
+      "steeringTorque": float(actual.get("steering_torque", 0.0) or 0.0),
+      "standstill": bool(actual.get("standstill", v_ego < 0.01)),
+      "vEgo": v_ego,
+    })()
+    return type("CS", (), {
+      "CP": None,
+      "out": out,
+      "buttons_counter": int(actual.get("buttons_counter", 0) or 0),
+      "pscm_status": {
+        "HandsOffSWDetectionMode": int(actual.get("HandsOffSWDetectionMode", 0) or 0),
+        "HandsOffSWlDetectionStatus": int(actual.get("HandsOffSWlDetectionStatus", 1) or 1),
+        "LKATorqueDeliveredStatus": int(actual.get("LKATorqueDeliveredStatus", 1) or 1),
+        "LKADriverAppldTrq": int(actual.get("LKADriverAppldTrq", 0) or 0),
+        "LKATorqueDelivered": int(actual.get("LKATorqueDelivered", 0) or 0),
+        "LKATotalTorqueDelivered": int(actual.get("LKATotalTorqueDelivered", 0) or 0),
+        "RollingCounter": int(actual.get("RollingCounter", 0) or 0),
+        "PSCMStatusChecksum": int(actual.get("PSCMStatusChecksum", 0) or 0),
+      },
+      "loopback_lka_steering_cmd_updated": bool(actual.get("loopback_lka_steering_cmd_updated", False)),
+      "loopback_lka_steering_cmd_ts_nanos": int(actual.get("loopback_lka_steering_cmd_ts_nanos", 0) or 0),
+      "pt_lka_steering_cmd_counter": int(actual.get("pt_lka_steering_cmd_counter", 0) or 0),
+      "cam_lka_steering_cmd_counter": int(actual.get("cam_lka_steering_cmd_counter", 0) or 0),
+    })()
+
+  def build(self, steering: float, throttle_magnitude: float, brake_magnitude: float, actual: dict[str, Any] | None = None) -> list[Any]:
+    cc = self._make_cc(steering, throttle_magnitude, brake_magnitude, actual)
+    cs = self._make_cs(actual)
+    _, can_msgs = self.controller.update(cc, self.cp_sp, cs, int(time.monotonic() * 1e9))
+    self.frame += 1
+    return can_msgs
+
+
+_SHADOW_GM_CONTROLLER = _ShadowGMController()
+
+
 @dataclass
 class LiveSample:
   image_latent: np.ndarray = field(default_factory=lambda: np.zeros((1, STACK_SIZE, VAE_LATENT_DIM), dtype=np.float32))
   telemetry: np.ndarray = field(default_factory=lambda: np.zeros((1, STACK_SIZE, 1), dtype=np.float32))
   control_history: np.ndarray = field(default_factory=lambda: np.zeros((1, STACK_SIZE, CONTROL_HISTORY_DIM), dtype=np.float32))
   actual: dict[str, Any] = field(default_factory=dict)
+  actuator_map: dict[str, Any] = field(default_factory=dict)
   image: np.ndarray | None = None
   timestamp: float = 0.0
 
@@ -177,6 +326,10 @@ class LiveSampler(threading.Thread):
       "steering_rate": 0.0,
     }
     self._last_powertrain_control_time = 0.0
+    self._last_actuator_map: dict[str, Any] = {"enabled": False, "actuation_allowed": False}
+    self._actuation_requested = False
+    self._sendcan = messaging.pub_sock("sendcan") if (messaging is not None and SHADOWMODE_ENABLE_ACTUATION and can_list_to_can_capnp is not None) else None
+    self._shadow_can_frame = 0
 
   def current(self) -> LiveSample:
     with self._lock:
@@ -433,6 +586,21 @@ class LiveSampler(threading.Thread):
     brake = self._clip(self._last_powertrain_controls["brake"], 0.0, 1.0)
     steering = self._clip(self._last_powertrain_controls["steering"], -1.0, 1.0)
     steering_rate = self._clip(self._last_powertrain_controls["steering_rate"], -1.0, 1.0)
+    actuation_enabled = bool(self._actuation_requested and self._sendcan is not None)
+    self._last_actuator_map = map_shadow_controls_to_gm_can(steering=steering, throttle_magnitude=gas, brake_magnitude=brake)
+    self._last_actuator_map.update({
+      "requested": bool(self._actuation_requested),
+      "enabled": actuation_enabled,
+      "actuation_allowed": actuation_enabled,
+      "ui_enabled": bool(self._actuation_requested),
+      "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION),
+      "canTransmit": bool(self._sendcan is not None),
+      "reason": "enabled" if actuation_enabled else ("hard gate disabled" if not SHADOWMODE_ENABLE_ACTUATION else ("ui disabled" if not self._actuation_requested else "sendcan unavailable")),
+    })
+    if actuation_enabled:
+      can_msgs = _SHADOW_GM_CONTROLLER.build(steering=steering, throttle_magnitude=gas, brake_magnitude=brake, actual=self._last_powertrain_controls)
+      if can_msgs:
+        self._sendcan.send(can_list_to_can_capnp(can_msgs, msgtype="sendcan"))
 
     image = self._read_camera_image()
     if image is not None:
@@ -466,6 +634,7 @@ class LiveSampler(threading.Thread):
         "powertrain_control_age_seconds": None if self._last_powertrain_control_time <= 0.0 else (now - self._last_powertrain_control_time),
         "has_live_rgb": image is not None,
       },
+      actuator_map=self._last_actuator_map,
       timestamp=now,
     )
 
@@ -481,6 +650,7 @@ class LiveSampler(threading.Thread):
       telemetry=telemetry,
       control_history=control_history,
       actual={"speed": 0.0, "throttle": 0.0, "brake": 0.0, "steering": 0.0, "source": "stub"},
+      actuator_map={"enabled": False, "actuation_allowed": False, "requested": False, "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION)},
       image=None,
       timestamp=now,
     )
@@ -736,6 +906,10 @@ class ShadowInferenceWorker(threading.Thread):
       "vaeReady": False,
       "modelType": None,
       "vaeType": None,
+      "shadowActuationRequested": False,
+      "shadowActuationEnabled": False,
+      "shadowActuationHardGate": bool(SHADOWMODE_ENABLE_ACTUATION),
+      "shadowActuationReason": "ui disabled",
       "inputs": [],
       "outputs": [],
       "vaeInputs": [],
@@ -775,6 +949,14 @@ class ShadowInferenceWorker(threading.Thread):
   def snapshot(self) -> dict[str, Any]:
     with self._lock:
       return dict(self._state)
+
+  def set_actuation_requested(self, requested: bool) -> None:
+    with self._lock:
+      self._actuation_requested = bool(requested)
+
+  def actuation_requested(self) -> bool:
+    with self._lock:
+      return bool(getattr(self, "_actuation_requested", False))
 
   def _set_state(self, **values: Any) -> None:
     with self._lock:
@@ -1016,6 +1198,13 @@ def _status() -> dict[str, Any]:
       status_probe_error = str(e)
   worker = INFERENCE_WORKER.snapshot()
   latest = worker.get("lastInference") or {}
+  actuation_requested = INFERENCE_WORKER.actuation_requested()
+  actuation_enabled = bool(actuation_requested and SHADOWMODE_ENABLE_ACTUATION and worker["running"] and worker["enabled"])
+  actuation_reason = "enabled" if actuation_enabled else (
+    "hard gate disabled" if not SHADOWMODE_ENABLE_ACTUATION else (
+      "inference not running" if not worker["running"] else ("ui disabled" if not actuation_requested else "waiting for sendcan")
+    )
+  )
   model_uploaded = MODEL_UPLOAD["revision"] > 0
   vae_uploaded = VAE_UPLOAD["revision"] > 0
   policy_loaded_revision = worker["policyLoadedRevision"]
@@ -1058,6 +1247,10 @@ def _status() -> dict[str, Any]:
     "vaePath": str(VAE_PATH),
     "modelType": worker["modelType"],
     "vaeType": worker["vaeType"],
+    "shadowActuationRequested": actuation_requested,
+    "shadowActuationEnabled": actuation_enabled,
+    "shadowActuationHardGate": bool(SHADOWMODE_ENABLE_ACTUATION),
+    "shadowActuationReason": actuation_reason,
     "liveTimestamp": current.timestamp,
     "liveInputs": live_inputs,
     "statusProbeAvailableStreams": status_probe_streams,
@@ -1091,6 +1284,7 @@ def _status() -> dict[str, Any]:
     "latestInference": latest,
     "lastSample": current.actual,
     "actual": current.actual if current else {},
+    "actuatorMap": current.actuator_map if current else {},
     "predicted": latest.get("predicted", {}),
     "sessionError": worker["lastPolicyError"],
     "vaeError": worker["lastVaeError"],
@@ -1210,6 +1404,23 @@ class ShadowHandler(SimpleHTTPRequestHandler):
       _ensure_inference_worker_started()
       INFERENCE_WORKER.stop_inference()
       self._send_json({"ok": True, "message": "inference stopped", "status": _status()})
+      return
+    if self.path == "/shadow/actuation":
+      _ensure_inference_worker_started()
+      length = int(self.headers.get("Content-Length", "0"))
+      body = self.rfile.read(length) if length > 0 else b"{}"
+      try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+      except Exception:
+        payload = {}
+      requested = bool(payload.get("enabled", False))
+      INFERENCE_WORKER.set_actuation_requested(requested)
+      self._send_json({
+        "ok": True,
+        "message": "shadow actuation updated",
+        "requested": requested,
+        "status": _status(),
+      })
       return
     self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
