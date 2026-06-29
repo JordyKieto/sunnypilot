@@ -33,6 +33,11 @@ VAE_LATENT_DIM = 128
 CONTROL_HISTORY_DIM = 4
 STEERING_ANGLE_SCALE_DEG = 540.0
 STEERING_RATE_SCALE_DEG = 540.0
+CAN_BUS_POWERTRAIN = 0
+CAN_ACCELERATOR_PEDAL = 0x1C4
+CAN_BRAKE_PEDAL = 0x0BE
+CAN_STEERING_ANGLE = 0x1E5
+CAN_SIGNAL_MAX_AGE_SECONDS = 0.05
 
 try:
   import tinygrad.nn.onnx as tinygrad_onnx
@@ -91,6 +96,37 @@ def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
   return decoded
 
 
+def extract_motorola_signal(payload, start_bit, bit_length, signed=False):
+  value = 0
+  bit = int(start_bit)
+  for _ in range(int(bit_length)):
+    byte_index = bit // 8
+    bit_index = bit % 8
+    if byte_index >= len(payload):
+      raise ValueError("payload too short for CAN signal")
+    value = (value << 1) | ((payload[byte_index] >> bit_index) & 1)
+    bit = bit + 15 if bit_index == 0 else bit - 1
+
+  if signed and value & (1 << (bit_length - 1)):
+    value -= 1 << bit_length
+  return value
+
+
+def decode_powertrain_control_frame(address, payload):
+  if address == CAN_ACCELERATOR_PEDAL and len(payload) >= 6:
+    return {"throttle": extract_motorola_signal(payload, 47, 8) / 254.0}
+  if address == CAN_BRAKE_PEDAL and len(payload) >= 2:
+    return {"brake": extract_motorola_signal(payload, 15, 8) / 255.0}
+  if address == CAN_STEERING_ANGLE and len(payload) >= 5:
+    angle_deg = extract_motorola_signal(payload, 15, 16, signed=True) * 0.0625
+    rate_deg_s = extract_motorola_signal(payload, 27, 12, signed=True)
+    return {
+      "steering": angle_deg / STEERING_ANGLE_SCALE_DEG,
+      "steering_rate": rate_deg_s / 720.0,
+    }
+  return {}
+
+
 @dataclass
 class LiveSample:
   image_latent: np.ndarray = field(default_factory=lambda: np.zeros((1, STACK_SIZE, VAE_LATENT_DIM), dtype=np.float32))
@@ -107,9 +143,10 @@ class LiveSampler(threading.Thread):
   def __init__(self) -> None:
     super().__init__(name="shadowmode-live-sampler")
     self._lock = threading.Lock()
-    self._stop = threading.Event()
+    self._stop_event = threading.Event()
     self._started_once = False
     self._sm = None
+    self._can_sock = None
     self._image_latents = deque(maxlen=STACK_SIZE)
     self._telemetry = deque(maxlen=STACK_SIZE)
     self._control_history = deque(maxlen=STACK_SIZE)
@@ -133,10 +170,36 @@ class LiveSampler(threading.Thread):
     self._last_stream_reconnect_time = 0.0
     self._last_stream_reconnect_reason: str | None = None
     self._latest = self._make_stub_sample()
+    self._last_powertrain_controls = {
+      "throttle": 0.0,
+      "brake": 0.0,
+      "steering": 0.0,
+      "steering_rate": 0.0,
+    }
+    self._last_powertrain_control_time = 0.0
 
   def current(self) -> LiveSample:
     with self._lock:
       return self._latest
+
+  def _update_powertrain_controls_from_can(self) -> None:
+    if messaging is None:
+      return
+    if self._can_sock is None:
+      self._can_sock = messaging.sub_sock("can", conflate=False, timeout=0)
+    if self._can_sock is None:
+      return
+    try:
+      for msg in messaging.drain_sock(self._can_sock, wait_for_one=False):
+        for frame in getattr(msg, "can", []):
+          if int(frame.src) != CAN_BUS_POWERTRAIN:
+            continue
+          decoded = decode_powertrain_control_frame(int(frame.address), bytes(frame.dat))
+          if decoded:
+            self._last_powertrain_controls.update(decoded)
+            self._last_powertrain_control_time = time.time()
+    except Exception as e:
+      self._last_stream_error = f"can decode failed: {e}"
 
   def diagnostics(self) -> dict[str, Any]:
     with self._lock:
@@ -196,7 +259,7 @@ class LiveSampler(threading.Thread):
       }
 
   def stop(self) -> None:
-    self._stop.set()
+    self._stop_event.set()
 
   def _update_latest(self, sample: LiveSample) -> None:
     with self._lock:
@@ -364,12 +427,12 @@ class LiveSampler(threading.Thread):
       car_state_updated = bool(self._sm.updated.get("carState", False))
       car_state_alive = bool(self._sm.alive.get("carState", False))
       car_state_valid = bool(self._sm.valid.get("carState", False))
+    self._update_powertrain_controls_from_can()
     speed = self._clip(self._to_float(getattr(car_state, "vEgo", 0.0) if car_state is not None else 0.0) / 30.0, 0.0, 2.0)
-    gas = self._clip(self._to_float(getattr(car_state, "gas", 0.0) if car_state is not None else 0.0), 0.0, 1.0)
-    brake = self._clip(self._to_float(getattr(car_state, "brake", 0.0) if car_state is not None else 0.0), 0.0, 1.0)
-    steering_angle = self._to_float(getattr(car_state, "steeringAngleDeg", 0.0) if car_state is not None else 0.0)
-    steering = self._clip(steering_angle / STEERING_ANGLE_SCALE_DEG, -1.0, 1.0)
-    steering_rate = self._steering_rate(car_state, steering, now)
+    gas = self._clip(self._last_powertrain_controls["throttle"], 0.0, 1.0)
+    brake = self._clip(self._last_powertrain_controls["brake"], 0.0, 1.0)
+    steering = self._clip(self._last_powertrain_controls["steering"], -1.0, 1.0)
+    steering_rate = self._clip(self._last_powertrain_controls["steering_rate"], -1.0, 1.0)
 
     image = self._read_camera_image()
     if image is not None:
@@ -400,6 +463,7 @@ class LiveSampler(threading.Thread):
         "car_state_alive": car_state_alive,
         "car_state_valid": car_state_valid,
         "car_state_age_seconds": car_state_age,
+        "powertrain_control_age_seconds": None if self._last_powertrain_control_time <= 0.0 else (now - self._last_powertrain_control_time),
         "has_live_rgb": image is not None,
       },
       timestamp=now,
@@ -430,7 +494,7 @@ class LiveSampler(threading.Thread):
       return self._latest
 
   def run(self) -> None:
-    while not self._stop.is_set():
+    while not self._stop_event.is_set():
       try:
         self._last_loop_time = time.time()
         self._loop_count += 1
@@ -630,7 +694,7 @@ class ShadowInferenceWorker(threading.Thread):
   def __init__(self) -> None:
     super().__init__(name="shadowmode-inference")
     self._lock = threading.Lock()
-    self._stop = threading.Event()
+    self._stop_event = threading.Event()
     self._started_once = False
     self._enabled = False
     self._model_rev_seen = -1
@@ -891,7 +955,7 @@ class ShadowInferenceWorker(threading.Thread):
       cloudlog.exception("shadowmode policy inference failed: %s", e)
 
   def run(self) -> None:
-    while not self._stop.is_set():
+    while not self._stop_event.is_set():
       try:
         self._load_changed_models()
         with self._lock:
