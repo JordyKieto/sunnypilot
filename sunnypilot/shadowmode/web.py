@@ -18,8 +18,9 @@ from openpilot.common.basedir import BASEDIR
 from openpilot.common.swaglog import cloudlog
 from opendbc.car import structs
 from opendbc.car.gm.carcontroller import CarController
+from opendbc.car.gm.carstate import CarState as GMCarState
 from opendbc.car.gm.interface import CarInterface
-from opendbc.car.gm.values import CAR
+from opendbc.car.gm.values import CAR, CarControllerParams
 from opendbc.sunnypilot.car.gm.values_ext import GMFlagsSP
 
 STATIC_DIR = Path(BASEDIR) / "sunnypilot" / "shadowmode" / "static"
@@ -40,18 +41,27 @@ CONTROL_HISTORY_DIM = 4
 STEERING_ANGLE_SCALE_DEG = 540.0
 STEERING_RATE_SCALE_DEG = 540.0
 CAN_BUS_POWERTRAIN = 0
+CAN_BUS_CAMERA = 2
+CAN_BUS_LOOPBACK = 128
 CAN_ACCELERATOR_PEDAL = 0x1C4
 CAN_BRAKE_PEDAL = 0x0BE
 CAN_STEERING_ANGLE = 0x1E5
+CAN_LKA_STEERING_CMD = 0x180   # ASCMLKASteeringCmd
+CAN_PSCM_STATUS = 0x184        # PSCMStatus
+CAN_STEERING_BUTTON = 0x1E1    # ASCMSteeringButton
 CAN_SIGNAL_MAX_AGE_SECONDS = 0.05
 SHADOWMODE_ENABLE_ACTUATION = os.environ.get("SHADOWMODE_ENABLE_ACTUATION", "0") == "1"
-GM_STEER_MAX = 300.0
-GM_ACCEL_MIN = -4.0
-GM_ACCEL_MAX = 2.0
-GM_GAS_LOOKUP_BP = (-0.1, 0.0, GM_ACCEL_MAX)
-GM_GAS_LOOKUP_V = (-650.0, 0.0, 1018.0)
-GM_BRAKE_LOOKUP_BP = (GM_ACCEL_MIN, -0.1)
-GM_BRAKE_LOOKUP_V = (400.0, 0.0)
+# Derive lookup tables from actual Bolt EUV CarControllerParams (CAMERA_ACC_CAR):
+# MAX_GAS=1346, MAX_ACC_REGEN=-540, INACTIVE_REGEN=-500, max_regen_acceleration=0.
+_BOLT_EUV_CP = CarInterface.get_non_essential_params(CAR.CHEVROLET_BOLT_EUV)
+_BOLT_EUV_PARAMS = CarControllerParams(_BOLT_EUV_CP)
+GM_STEER_MAX = float(_BOLT_EUV_PARAMS.STEER_MAX)
+GM_ACCEL_MIN = float(_BOLT_EUV_PARAMS.ACCEL_MIN)
+GM_ACCEL_MAX = float(_BOLT_EUV_PARAMS.ACCEL_MAX)
+GM_GAS_LOOKUP_BP = tuple(float(x) for x in _BOLT_EUV_PARAMS.GAS_LOOKUP_BP)
+GM_GAS_LOOKUP_V = tuple(float(x) for x in _BOLT_EUV_PARAMS.GAS_LOOKUP_V)
+GM_BRAKE_LOOKUP_BP = tuple(float(x) for x in _BOLT_EUV_PARAMS.BRAKE_LOOKUP_BP)
+GM_BRAKE_LOOKUP_V = tuple(float(x) for x in _BOLT_EUV_PARAMS.BRAKE_LOOKUP_V)
 
 try:
   import tinygrad.nn.onnx as tinygrad_onnx
@@ -148,6 +158,29 @@ def decode_powertrain_control_frame(address, payload):
   return {}
 
 
+def decode_lka_steering_cmd_counter(payload: bytes) -> int:
+  """Extract RollingCounter (bits 5|2@0+) from ASCMLKASteeringCmd."""
+  if len(payload) < 1:
+    return 0
+  return int(extract_motorola_signal(payload, 5, 2))
+
+
+def decode_pscm_status_frame(payload: bytes) -> dict[str, Any]:
+  """Decode all PSCMStatus fields from raw 8-byte CAN payload into physical values."""
+  if len(payload) < 8:
+    return {}
+  return {
+    "HandsOffSWDetectionMode": int(extract_motorola_signal(payload, 20, 2)),
+    "HandsOffSWlDetectionStatus": int(extract_motorola_signal(payload, 21, 1)),
+    "LKATorqueDeliveredStatus": int(extract_motorola_signal(payload, 5, 3)),
+    "LKADriverAppldTrq": float(extract_motorola_signal(payload, 50, 11, signed=True)) * 0.01,
+    "LKATorqueDelivered": float(extract_motorola_signal(payload, 18, 11, signed=True)) * 0.01,
+    "LKATotalTorqueDelivered": float(extract_motorola_signal(payload, 2, 11, signed=True)) * 0.01,
+    "RollingCounter": int(extract_motorola_signal(payload, 38, 4)),
+    "PSCMStatusChecksum": int(extract_motorola_signal(payload, 33, 10)),
+  }
+
+
 def map_shadow_controls_to_gm_can(steering: float | None = None,
                                   throttle_magnitude: float | None = None,
                                   brake_magnitude: float | None = None) -> dict[str, Any]:
@@ -208,7 +241,7 @@ def map_shadow_controls_to_gm_can(steering: float | None = None,
 
 class _ShadowGMController:
   def __init__(self) -> None:
-    cp = CarInterface.get_non_essential_params(CAR.CHEVROLET_BOLT_EUV)
+    cp = _BOLT_EUV_CP
     cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.CHEVROLET_BOLT_EUV)
     cp_sp.flags |= int(GMFlagsSP.NON_ACC)
     cp.openpilotLongitudinalControl = True
@@ -216,58 +249,46 @@ class _ShadowGMController:
     self.cp_sp = cp_sp
     self.controller = CarController({}, cp, cp_sp)
     self.frame = 0
+    # Persistent real CarState — hydrated from live data on each build() call.
+    # Avoids the synthetic duck-typed object and keeps counter state across frames.
+    self._live_cs = GMCarState(cp, cp_sp)
+    # Seed pscm_status so create_pscm_status() can always access it before CAN data arrives.
+    self._live_cs.pscm_status = {
+      "HandsOffSWDetectionMode": 0,
+      "HandsOffSWlDetectionStatus": 1,
+      "LKATorqueDeliveredStatus": 1,
+      "LKADriverAppldTrq": 0.0,
+      "LKATorqueDelivered": 0.0,
+      "LKATotalTorqueDelivered": 0.0,
+      "RollingCounter": 0,
+      "PSCMStatusChecksum": 0,
+    }
 
-  @staticmethod
-  def _make_cc(steering: float, throttle_magnitude: float, brake_magnitude: float, actual: dict[str, Any] | None = None):
-    cc = structs.CarControl.new_message()
-    cc.enabled = True
-    cc.latActive = True
-    cc.longActive = True
-    cc.cruiseControl.cancel = False
-    cc.actuators.torque = float(np.clip(steering, -1.0, 1.0))
-    cc.actuators.accel = float(np.clip(throttle_magnitude - brake_magnitude, GM_ACCEL_MIN, GM_ACCEL_MAX))
-    cc.actuators.gas = float(np.clip(throttle_magnitude, 0.0, 1.0))
-    cc.actuators.brake = float(np.clip(brake_magnitude, 0.0, 1.0))
-    cc.actuators.longControlState = structs.CarControl.Actuators.LongControlState.stopping if cc.actuators.accel <= 0.0 else structs.CarControl.Actuators.LongControlState.pid
-    cc.hudControl.visualAlert = structs.CarControl.HUDControl.VisualAlert.none
-    cc.hudControl.setSpeed = float(actual.get("cruise_speed", 0.0) if actual else 0.0)
-    cc.hudControl.leadDistanceBars = int(actual.get("lead_distance_bars", 0) if actual else 0)
-    cc.hudControl.leadVisible = bool(actual.get("lead_visible", False) if actual else False)
-    return cc
+  def build(self, cc_cereal: Any, cs_live: dict[str, Any], car_state_cereal: Any = None) -> list[Any]:
+    """
+    cc_cereal:        real structs.CarControl reader from self._sm["carControl"]
+    cs_live:          dict of live-decoded CAN/cereal state for GM-specific CS fields
+    car_state_cereal: real structs.CarState reader from self._sm["carState"]
+    """
+    if cc_cereal is None:
+      # No live CarControl yet — emit nothing rather than sending garbage.
+      return []
 
-  @staticmethod
-  def _make_cs(actual: dict[str, Any] | None = None):
-    actual = actual or {}
-    v_ego = float(actual.get("speed", 0.0) or 0.0)
-    out = type("Out", (), {
-      "steeringTorque": float(actual.get("steering_torque", 0.0) or 0.0),
-      "standstill": bool(actual.get("standstill", v_ego < 0.01)),
-      "vEgo": v_ego,
-    })()
-    return type("CS", (), {
-      "CP": None,
-      "out": out,
-      "buttons_counter": int(actual.get("buttons_counter", 0) or 0),
-      "pscm_status": {
-        "HandsOffSWDetectionMode": int(actual.get("HandsOffSWDetectionMode", 0) or 0),
-        "HandsOffSWlDetectionStatus": int(actual.get("HandsOffSWlDetectionStatus", 1) or 1),
-        "LKATorqueDeliveredStatus": int(actual.get("LKATorqueDeliveredStatus", 1) or 1),
-        "LKADriverAppldTrq": int(actual.get("LKADriverAppldTrq", 0) or 0),
-        "LKATorqueDelivered": int(actual.get("LKATorqueDelivered", 0) or 0),
-        "LKATotalTorqueDelivered": int(actual.get("LKATotalTorqueDelivered", 0) or 0),
-        "RollingCounter": int(actual.get("RollingCounter", 0) or 0),
-        "PSCMStatusChecksum": int(actual.get("PSCMStatusChecksum", 0) or 0),
-      },
-      "loopback_lka_steering_cmd_updated": bool(actual.get("loopback_lka_steering_cmd_updated", False)),
-      "loopback_lka_steering_cmd_ts_nanos": int(actual.get("loopback_lka_steering_cmd_ts_nanos", 0) or 0),
-      "pt_lka_steering_cmd_counter": int(actual.get("pt_lka_steering_cmd_counter", 0) or 0),
-      "cam_lka_steering_cmd_counter": int(actual.get("cam_lka_steering_cmd_counter", 0) or 0),
-    })()
+    # Bind real carState output struct — controller reads vEgo, standstill, steeringTorque from here.
+    if car_state_cereal is not None:
+      self._live_cs.out = car_state_cereal
 
-  def build(self, steering: float, throttle_magnitude: float, brake_magnitude: float, actual: dict[str, Any] | None = None) -> list[Any]:
-    cc = self._make_cc(steering, throttle_magnitude, brake_magnitude, actual)
-    cs = self._make_cs(actual)
-    _, can_msgs = self.controller.update(cc, self.cp_sp, cs, int(time.monotonic() * 1e9))
+    # Hydrate GM-specific fields from live CAN tracking.
+    pscm = cs_live.get("pscm_status")
+    if pscm:
+      self._live_cs.pscm_status = pscm
+    self._live_cs.loopback_lka_steering_cmd_updated = bool(cs_live.get("loopback_lka_steering_cmd_updated", False))
+    self._live_cs.loopback_lka_steering_cmd_ts_nanos = int(cs_live.get("loopback_lka_steering_cmd_ts_nanos", 0) or 0)
+    self._live_cs.pt_lka_steering_cmd_counter = int(cs_live.get("pt_lka_steering_cmd_counter", 0) or 0)
+    self._live_cs.cam_lka_steering_cmd_counter = int(cs_live.get("cam_lka_steering_cmd_counter", 0) or 0)
+    self._live_cs.buttons_counter = int(cs_live.get("buttons_counter", 0) or 0)
+
+    _, can_msgs = self.controller.update(cc_cereal, self.cp_sp, self._live_cs, int(time.monotonic() * 1e9))
     self.frame += 1
     return can_msgs
 
@@ -326,6 +347,21 @@ class LiveSampler(threading.Thread):
       "steering_rate": 0.0,
     }
     self._last_powertrain_control_time = 0.0
+    self._last_pscm_status: dict[str, Any] = {
+      "HandsOffSWDetectionMode": 0,
+      "HandsOffSWlDetectionStatus": 1,
+      "LKATorqueDeliveredStatus": 1,
+      "LKADriverAppldTrq": 0.0,
+      "LKATorqueDelivered": 0.0,
+      "LKATotalTorqueDelivered": 0.0,
+      "RollingCounter": 0,
+      "PSCMStatusChecksum": 0,
+    }
+    self._loopback_lka_steering_cmd_updated = False
+    self._loopback_lka_steering_cmd_ts_nanos = 0
+    self._pt_lka_steering_cmd_counter = 0
+    self._cam_lka_steering_cmd_counter = 0
+    self._buttons_counter = 0
     self._last_actuator_map: dict[str, Any] = {"enabled": False, "actuation_allowed": False}
     self._actuation_requested = False
     self._sendcan = messaging.pub_sock("sendcan") if (messaging is not None and SHADOWMODE_ENABLE_ACTUATION and can_list_to_can_capnp is not None) else None
@@ -342,15 +378,36 @@ class LiveSampler(threading.Thread):
       self._can_sock = messaging.sub_sock("can", conflate=False, timeout=0)
     if self._can_sock is None:
       return
+    self._loopback_lka_steering_cmd_updated = False
     try:
+      now_nanos = int(time.monotonic() * 1e9)
       for msg in messaging.drain_sock(self._can_sock, wait_for_one=False):
         for frame in getattr(msg, "can", []):
-          if int(frame.src) != CAN_BUS_POWERTRAIN:
-            continue
-          decoded = decode_powertrain_control_frame(int(frame.address), bytes(frame.dat))
-          if decoded:
-            self._last_powertrain_controls.update(decoded)
-            self._last_powertrain_control_time = time.time()
+          src = int(frame.src)
+          addr = int(frame.address)
+          dat = bytes(frame.dat)
+
+          if src == CAN_BUS_POWERTRAIN:
+            decoded = decode_powertrain_control_frame(addr, dat)
+            if decoded:
+              self._last_powertrain_controls.update(decoded)
+              self._last_powertrain_control_time = time.time()
+            if addr == CAN_PSCM_STATUS:
+              pscm = decode_pscm_status_frame(dat)
+              if pscm:
+                self._last_pscm_status.update(pscm)
+            elif addr == CAN_LKA_STEERING_CMD:
+              self._pt_lka_steering_cmd_counter = decode_lka_steering_cmd_counter(dat)
+
+          elif src == CAN_BUS_CAMERA:
+            if addr == CAN_LKA_STEERING_CMD:
+              self._cam_lka_steering_cmd_counter = decode_lka_steering_cmd_counter(dat)
+
+          elif src == CAN_BUS_LOOPBACK:
+            if addr == CAN_LKA_STEERING_CMD:
+              self._loopback_lka_steering_cmd_updated = True
+              self._loopback_lka_steering_cmd_ts_nanos = now_nanos
+
     except Exception as e:
       self._last_stream_error = f"can decode failed: {e}"
 
@@ -581,11 +638,37 @@ class LiveSampler(threading.Thread):
       car_state_alive = bool(self._sm.alive.get("carState", False))
       car_state_valid = bool(self._sm.valid.get("carState", False))
     self._update_powertrain_controls_from_can()
-    speed = self._clip(self._to_float(getattr(car_state, "vEgo", 0.0) if car_state is not None else 0.0) / 30.0, 0.0, 2.0)
+
+    # Real vehicle state from carState cereal message
+    v_ego = self._to_float(getattr(car_state, "vEgo", 0.0) if car_state is not None else 0.0)
+    standstill = bool(getattr(car_state, "standstill", v_ego < 0.01) if car_state is not None else (v_ego < 0.01))
+    steering_torque = self._to_float(getattr(car_state, "steeringTorque", 0.0) if car_state is not None else 0.0)
+    eps_torque = self._to_float(getattr(car_state, "steeringTorqueEps", 0.0) if car_state is not None else 0.0)
+
+    speed = self._clip(v_ego / 30.0, 0.0, 2.0)
     gas = self._clip(self._last_powertrain_controls["throttle"], 0.0, 1.0)
     brake = self._clip(self._last_powertrain_controls["brake"], 0.0, 1.0)
     steering = self._clip(self._last_powertrain_controls["steering"], -1.0, 1.0)
     steering_rate = self._clip(self._last_powertrain_controls["steering_rate"], -1.0, 1.0)
+
+    # Merge CAN-decoded PSCM status with higher-fidelity cereal torque values
+    live_pscm = dict(self._last_pscm_status)
+    live_pscm["LKADriverAppldTrq"] = steering_torque
+    live_pscm["LKATorqueDelivered"] = eps_torque
+
+    # GM-specific live state passed to build() to hydrate the real GMCarState instance
+    cs_actual = {
+      "speed": v_ego,
+      "standstill": standstill,
+      "steering_torque": steering_torque,
+      "pscm_status": live_pscm,
+      "loopback_lka_steering_cmd_updated": self._loopback_lka_steering_cmd_updated,
+      "loopback_lka_steering_cmd_ts_nanos": self._loopback_lka_steering_cmd_ts_nanos,
+      "pt_lka_steering_cmd_counter": self._pt_lka_steering_cmd_counter,
+      "cam_lka_steering_cmd_counter": self._cam_lka_steering_cmd_counter,
+      "buttons_counter": self._buttons_counter,
+    }
+
     actuation_enabled = bool(self._actuation_requested and self._sendcan is not None)
     self._last_actuator_map = map_shadow_controls_to_gm_can(steering=steering, throttle_magnitude=gas, brake_magnitude=brake)
     self._last_actuator_map.update({
@@ -598,7 +681,11 @@ class LiveSampler(threading.Thread):
       "reason": "enabled" if actuation_enabled else ("hard gate disabled" if not SHADOWMODE_ENABLE_ACTUATION else ("ui disabled" if not self._actuation_requested else "sendcan unavailable")),
     })
     if actuation_enabled:
-      can_msgs = _SHADOW_GM_CONTROLLER.build(steering=steering, throttle_magnitude=gas, brake_magnitude=brake, actual=self._last_powertrain_controls)
+      can_msgs = _SHADOW_GM_CONTROLLER.build(
+        cc_cereal=car_control,
+        cs_live=cs_actual,
+        car_state_cereal=car_state,
+      )
       if can_msgs:
         self._sendcan.send(can_list_to_can_capnp(can_msgs, msgtype="sendcan"))
 
@@ -618,11 +705,14 @@ class LiveSampler(threading.Thread):
       control_history=control_history,
       image=image,
       actual={
-        "speed": speed * 30.0,
+        "speed": v_ego,
         "throttle": gas,
         "brake": brake,
         "steering": steering,
         "steering_rate": steering_rate,
+        "steering_torque": steering_torque,
+        "eps_torque": eps_torque,
+        "standstill": standstill,
         "command_accel": self._to_float(self._nested_attr(car_control, "actuators.accel", 0.0)),
         "command_torque": self._to_float(self._nested_attr(car_control, "actuators.torque", 0.0)),
         "source": "device" if car_state_seen else ("device_waiting_for_carState" if self._sm is not None else "stub"),
@@ -633,6 +723,10 @@ class LiveSampler(threading.Thread):
         "car_state_age_seconds": car_state_age,
         "powertrain_control_age_seconds": None if self._last_powertrain_control_time <= 0.0 else (now - self._last_powertrain_control_time),
         "has_live_rgb": image is not None,
+        "pscm_rolling_counter": live_pscm["RollingCounter"],
+        "loopback_lka_updated": self._loopback_lka_steering_cmd_updated,
+        "cam_lka_counter": self._cam_lka_steering_cmd_counter,
+        "pt_lka_counter": self._pt_lka_steering_cmd_counter,
       },
       actuator_map=self._last_actuator_map,
       timestamp=now,
@@ -649,7 +743,8 @@ class LiveSampler(threading.Thread):
       image_latent=image_latent,
       telemetry=telemetry,
       control_history=control_history,
-      actual={"speed": 0.0, "throttle": 0.0, "brake": 0.0, "steering": 0.0, "source": "stub"},
+      actual={"speed": 0.0, "throttle": 0.0, "brake": 0.0, "steering": 0.0, "steering_torque": 0.0,
+              "eps_torque": 0.0, "standstill": True, "source": "stub"},
       actuator_map={"enabled": False, "actuation_allowed": False, "requested": False, "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION)},
       image=None,
       timestamp=now,
