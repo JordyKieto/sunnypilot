@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import mimetypes
+import os
 import tempfile
 import threading
 import time
@@ -15,6 +16,10 @@ import numpy as np
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.swaglog import cloudlog
+
+# Tinygrad expects DEBUG to be numeric; some shells inherit values like "release".
+if os.getenv("DEBUG") and not os.getenv("DEBUG").isdigit():
+  os.environ["DEBUG"] = "0"
 
 STATIC_DIR = Path(BASEDIR) / "sunnypilot" / "shadowmode" / "static"
 MODEL_PATH = Path(tempfile.gettempdir()) / "shadowmode_model.onnx"
@@ -40,9 +45,9 @@ CAN_STEERING_ANGLE = 0x1E5
 CAN_SIGNAL_MAX_AGE_SECONDS = 0.05
 
 try:
-  import tinygrad.nn.onnx as tinygrad_onnx
+  from tinygrad.nn.onnx import OnnxRunner
 except Exception:  # pragma: no cover
-  tinygrad_onnx = None
+  OnnxRunner = None
 
 try:
   from tinygrad.tensor import Tensor
@@ -553,37 +558,14 @@ class LiveSampler(threading.Thread):
 
 class TinygradOnnxSession:
   def __init__(self, onnx_path: Path) -> None:
-    if tinygrad_onnx is None or Tensor is None:
+    if OnnxRunner is None or Tensor is None:
       raise RuntimeError("tinygrad is not available on this system")
     self.onnx_path = Path(onnx_path)
-    self.model = self._load_model(self.onnx_path)
+    self.model = OnnxRunner(str(self.onnx_path))
     self.model_type = type(self.model).__name__
     self.inputs_meta = self._read_meta("inputs")
     self.outputs_meta = self._read_meta("outputs")
     self.ready = True
-
-  def _load_model(self, onnx_path: Path) -> Any:
-    candidates = [
-      "load_onnx",
-      "build_onnx",
-      "OnnxRunner",
-      "ONNXRunner",
-      "Model",
-      "load",
-    ]
-    for name in candidates:
-      obj = getattr(tinygrad_onnx, name, None)
-      if obj is None:
-        continue
-      try:
-        if callable(obj):
-          try:
-            return obj(str(onnx_path))
-          except TypeError:
-            return obj(onnx_path)
-      except Exception:
-        continue
-    raise RuntimeError("No supported Tinygrad ONNX loader found in tinygrad.nn.onnx")
 
   def _read_meta(self, kind: str) -> list[dict[str, Any]]:
     meta: list[dict[str, Any]] = []
