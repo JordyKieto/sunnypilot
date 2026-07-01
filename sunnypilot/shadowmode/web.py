@@ -79,14 +79,24 @@ def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
       }
   decoded: dict[str, Any] = {}
   pedal_logits = outputs.get("pedal_state_logits")
+  state = None
   if pedal_logits is not None:
     state = int(np.argmax(np.asarray(pedal_logits), axis=-1).reshape(-1)[0])
     state_name = {0: "idle", 1: "throttle", 2: "brake"}.get(state, f"state_{state}")
     decoded["pedal_state"] = {"id": state, "name": state_name}
-  if "throttle_magnitude" in outputs:
-    decoded["throttle"] = float(np.asarray(outputs["throttle_magnitude"]).reshape(-1)[0])
-  if "brake_magnitude" in outputs:
-    decoded["brake"] = float(np.asarray(outputs["brake_magnitude"]).reshape(-1)[0])
+  throttle = float(np.asarray(outputs["throttle_magnitude"]).reshape(-1)[0]) if "throttle_magnitude" in outputs else None
+  brake = float(np.asarray(outputs["brake_magnitude"]).reshape(-1)[0]) if "brake_magnitude" in outputs else None
+  if state == 1:
+    brake = 0.0 if brake is not None else None
+  elif state == 2:
+    throttle = 0.0 if throttle is not None else None
+  elif state == 0:
+    throttle = 0.0 if throttle is not None else None
+    brake = 0.0 if brake is not None else None
+  if throttle is not None:
+    decoded["throttle"] = throttle
+  if brake is not None:
+    decoded["brake"] = brake
   if "steering" in outputs:
     decoded["steering"] = float(np.asarray(outputs["steering"]).reshape(-1)[0])
   if "vego" in outputs:
@@ -94,6 +104,36 @@ def _decode_controls(outputs: dict[str, np.ndarray]) -> dict[str, Any]:
   if "delta_v" in outputs:
     decoded["delta_v"] = float(np.asarray(outputs["delta_v"]).reshape(-1)[0])
   return decoded
+
+
+def _gate_longitudinal_controls(predicted: dict[str, Any]) -> dict[str, Any]:
+  gated = dict(predicted)
+  state = gated.get("pedal_state", {}).get("id")
+  throttle = gated.get("throttle")
+  brake = gated.get("brake")
+
+  if throttle is not None:
+    throttle = float(throttle)
+  if brake is not None:
+    brake = float(brake)
+
+  if state == 1:
+    if brake is not None:
+      brake = 0.0
+  elif state == 2:
+    if throttle is not None:
+      throttle = 0.0
+  elif state == 0:
+    if throttle is not None:
+      throttle = 0.0
+    if brake is not None:
+      brake = 0.0
+
+  if throttle is not None:
+    gated["throttle"] = throttle
+  if brake is not None:
+    gated["brake"] = brake
+  return gated
 
 
 def extract_motorola_signal(payload, start_bit, bit_length, signed=False):
@@ -788,7 +828,8 @@ class ShadowInferenceWorker(threading.Thread):
     row = {
       "time": time.time(),
       "actual": result.get("actual", {}),
-      "predicted": result.get("predicted", {}),
+      "predictedGated": result.get("predicted_gated", result.get("predicted", {})),
+      "predictedRaw": result.get("predicted_raw", result.get("predicted", {})),
       "vaeRuntime": vae_runtime,
       "modelType": result.get("modelType"),
       "outputs": result.get("outputs", []),
@@ -934,6 +975,10 @@ class ShadowInferenceWorker(threading.Thread):
     try:
       policy_start = time.monotonic()
       result = self._session.run(sample)
+      predicted_raw = result.get("predicted", {})
+      result["predicted_raw"] = predicted_raw
+      result["predicted_gated"] = _gate_longitudinal_controls(predicted_raw)
+      result["predicted"] = result["predicted_gated"]
       now = time.time()
       self._append_session_log(result, vae_runtime)
       self._set_state(
