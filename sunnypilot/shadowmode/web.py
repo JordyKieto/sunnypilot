@@ -973,6 +973,7 @@ class ShadowInferenceWorker(threading.Thread):
     self._vae_rev_seen = -1
     self._session: TinygradOnnxSession | None = None
     self._vae_session: TinygradOnnxSession | None = None
+    self._vae_session_thread_id: int | None = None
     self._log_path: Path | None = None
     self._log_count = 0
     self._actuation_requested = False
@@ -1193,20 +1194,22 @@ class ShadowInferenceWorker(threading.Thread):
       self._vae_rev_seen = VAE_REVISION
       if VAE_PATH.exists() and VAE_PATH.stat().st_size > 0:
         try:
-          self._vae_session = TinygradOnnxSession(VAE_PATH)
+          self._vae_session = None
+          self._vae_session_thread_id = None
           self._set_state(
             hasVae=True,
             vaeReady=True,
-            vaeType=self._vae_session.model_type,
-            vaeInputs=self._vae_session.inputs_meta,
-            vaeOutputs=self._vae_session.outputs_meta,
+            vaeType=None,
+            vaeInputs=[],
+            vaeOutputs=[],
             lastVaeError=None,
             vaeLoadTime=time.time(),
             vaeLoadedRevision=self._vae_rev_seen,
           )
-          cloudlog.info("shadowmode vae model loaded: %s", VAE_PATH)
+          cloudlog.info("shadowmode vae model marked ready: %s", VAE_PATH)
         except Exception as e:
           self._vae_session = None
+          self._vae_session_thread_id = None
           self._set_state(
             hasVae=False,
             vaeReady=False,
@@ -1218,6 +1221,22 @@ class ShadowInferenceWorker(threading.Thread):
             vaeErrorCount=self._state.get("vaeErrorCount", 0) + 1,
           )
           cloudlog.exception("shadowmode vae model load failed: %s", e)
+
+  def _ensure_vae_session(self) -> TinygradOnnxSession | None:
+    if not VAE_PATH.exists() or VAE_PATH.stat().st_size <= 0:
+      return None
+    thread_id = threading.get_ident()
+    if self._vae_session is None or self._vae_session_thread_id != thread_id:
+      self._vae_session = TinygradOnnxSession(VAE_PATH)
+      self._vae_session_thread_id = thread_id
+      self._set_state(
+        vaeType=self._vae_session.model_type,
+        vaeInputs=self._vae_session.inputs_meta,
+        vaeOutputs=self._vae_session.outputs_meta,
+        lastVaeError=None,
+      )
+      cloudlog.info("shadowmode vae model loaded on thread=%s: %s", thread_id, VAE_PATH)
+    return self._vae_session
 
   def _vae_input_name(self) -> str:
     if self._vae_session is None or not self._vae_session.inputs_meta:
@@ -1240,7 +1259,8 @@ class ShadowInferenceWorker(threading.Thread):
 
   def _encode_live_image(self, sample: LiveSample) -> tuple[LiveSample, dict[str, Any]]:
     _ensure_live_sampler_started()
-    if self._vae_session is None:
+    vae_session = self._ensure_vae_session()
+    if vae_session is None:
       return sample, {"ran": False, "reason": "vae not loaded"}
     if sample.image is None:
       camera = LIVE_SAMPLER.diagnostics()
@@ -1248,7 +1268,7 @@ class ShadowInferenceWorker(threading.Thread):
       reason = "no fresh live rgb frame" if frame_age is not None else "no live rgb frame"
       return sample, {"ran": False, "reason": reason, "frameAgeSeconds": frame_age, "camera": camera}
     image_batch = sample.image.reshape((1, 96, 160, 3)).astype(np.uint8)
-    outputs = self._vae_session.run_inputs({self._vae_input_name(): image_batch})
+    outputs = vae_session.run_inputs({self._vae_input_name(): image_batch})
     latent = self._select_vae_latent(outputs)
     updated = LIVE_SAMPLER.push_image_latent(latent)
     return updated, {
