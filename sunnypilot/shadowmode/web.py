@@ -2,6 +2,7 @@
 import json
 import mimetypes
 import os
+import contextlib
 import tempfile
 import threading
 import time
@@ -20,8 +21,7 @@ from opendbc.car import structs
 from opendbc.car.gm.carcontroller import CarController
 from opendbc.car.gm.carstate import CarState as GMCarState
 from opendbc.car.gm.interface import CarInterface
-from opendbc.car.gm.values import CAR, CarControllerParams
-from opendbc.sunnypilot.car.gm.values_ext import GMFlagsSP
+from opendbc.car.gm.values import CAR, CarControllerParams, GMSafetyFlags
 
 STATIC_DIR = Path(BASEDIR) / "sunnypilot" / "shadowmode" / "static"
 MODEL_PATH = Path(tempfile.gettempdir()) / "shadowmode_model.onnx"
@@ -51,6 +51,9 @@ CAN_PSCM_STATUS = 0x184  # PSCMStatus
 CAN_STEERING_BUTTON = 0x1E1  # ASCMSteeringButton
 CAN_SIGNAL_MAX_AGE_SECONDS = 0.05
 SHADOWMODE_ENABLE_ACTUATION = True
+GM_CAMERA_LONG_SAFETY_PARAM = int(
+  GMSafetyFlags.HW_CAM.value | GMSafetyFlags.HW_CAM_LONG.value | GMSafetyFlags.EV.value
+)
 # Derive lookup tables from actual Bolt EUV CarControllerParams (CAMERA_ACC_CAR):
 # MAX_GAS=1346, MAX_ACC_REGEN=-540, INACTIVE_REGEN=-500, max_regen_acceleration=0.
 _BOLT_EUV_CP = CarInterface.get_non_essential_params(CAR.CHEVROLET_BOLT_EUV)
@@ -77,6 +80,11 @@ except Exception:  # pragma: no cover
   Tensor = None
 
 try:
+  import tinygrad.helpers as tinygrad_helpers
+except Exception:  # pragma: no cover
+  tinygrad_helpers = None
+
+try:
   import cereal.messaging as messaging
 
   MESSAGING_IMPORT_ERROR = None
@@ -92,6 +100,38 @@ except Exception as e:  # pragma: no cover
   VisionIpcClient = None
   VisionStreamType = None
   VISIONIPC_IMPORT_ERROR = str(e)
+
+
+def _patch_tinygrad_cache_for_threads() -> None:
+  if tinygrad_helpers is None or getattr(tinygrad_helpers, "_shadowmode_thread_cache_patch", False):
+    return
+
+  thread_local = threading.local()
+
+  def db_connection():
+    conn = getattr(thread_local, "db_connection", None)
+    if conn is None:
+      cache_db = tinygrad_helpers.CACHEDB
+      os.makedirs(cache_db.rsplit(os.sep, 1)[0], exist_ok=True)
+      conn = tinygrad_helpers.sqlite3.connect(
+        cache_db,
+        timeout=60,
+        isolation_level="IMMEDIATE",
+      )
+      with contextlib.suppress(tinygrad_helpers.sqlite3.OperationalError):
+        conn.execute("PRAGMA journal_mode=WAL").fetchone()
+      if getattr(tinygrad_helpers, "DEBUG", 0) >= 8:
+        conn.set_trace_callback(print)
+      thread_local.db_connection = conn
+    return conn
+
+  old_conn = getattr(tinygrad_helpers, "_db_connection", None)
+  if old_conn is not None:
+    with contextlib.suppress(Exception):
+      old_conn.close()
+  tinygrad_helpers._db_connection = None
+  tinygrad_helpers.db_connection = db_connection
+  tinygrad_helpers._shadowmode_thread_cache_patch = True
 
 try:
   from selfdrive.pandad.pandad_api_impl import can_list_to_can_capnp
@@ -267,7 +307,7 @@ def map_shadow_controls_to_gm_can(steering: float | None = None,
         },
         "friction_brake": {
           "name": "EBCMFrictionBrakeCmd",
-          "bus": 1,
+          "bus": 0,
           "fields": {
             "FrictionBrakeMode": 0x1,
             "FrictionBrakeCmd": -brake_cmd,
@@ -325,8 +365,10 @@ class _ShadowGMController:
   def __init__(self) -> None:
     cp = _BOLT_EUV_CP
     cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.CHEVROLET_BOLT_EUV)
-    cp_sp.flags |= int(GMFlagsSP.NON_ACC)
     cp.openpilotLongitudinalControl = True
+    cp.pcmCruise = False
+    if cp.safetyConfigs:
+      cp.safetyConfigs[0].safetyParam |= int(GMSafetyFlags.HW_CAM_LONG.value)
     self.cp = cp
     self.cp_sp = cp_sp
     self.controller = CarController({}, cp, cp_sp)
@@ -386,6 +428,7 @@ class LiveSample:
     default_factory=lambda: np.zeros((1, STACK_SIZE, CONTROL_HISTORY_DIM), dtype=np.float32))
   actual: dict[str, Any] = field(default_factory=dict)
   gm_live_state: dict[str, Any] = field(default_factory=dict)
+  panda_safety: dict[str, Any] = field(default_factory=dict)
   car_control: Any = None
   car_state: Any = None
   image: np.ndarray | None = None
@@ -578,7 +621,7 @@ class LiveSampler(threading.Thread):
       return
     if self._sm is None:
       services = ["carState", "roadCameraState", "liveCalibration", "deviceState", "carControl", "controlsState",
-                  "liveDelay"]
+                  "liveDelay", "pandaStates"]
       self._sm = messaging.SubMaster(services, poll="carState")
     if VisionIpcClient is None or VisionStreamType is None or self._vipc_client is not None:
       if VisionIpcClient is None or VisionStreamType is None:
@@ -633,6 +676,114 @@ class LiveSampler(threading.Thread):
       if cur is None:
         return default
     return cur
+
+  @staticmethod
+  def _enum_name(value: Any) -> str:
+    try:
+      return str(value)
+    except Exception:
+      return ""
+
+  @staticmethod
+  def _enum_raw(value: Any) -> int | None:
+    raw = getattr(value, "raw", None)
+    if raw is not None:
+      try:
+        return int(raw)
+      except Exception:
+        pass
+    try:
+      return int(value)
+    except Exception:
+      return None
+
+  def _panda_safety_snapshot(self) -> dict[str, Any]:
+    if self._sm is None:
+      return {"seen": False, "ready": False, "reason": "messaging unavailable"}
+
+    panda_states = self._sm["pandaStates"]
+    seen = bool(self._sm.seen.get("pandaStates", False))
+    alive = bool(self._sm.alive.get("pandaStates", False))
+    valid = bool(self._sm.valid.get("pandaStates", False))
+    if not seen or len(panda_states) == 0:
+      return {"seen": seen, "alive": alive, "valid": valid, "ready": False, "reason": "no panda state"}
+
+    expected_model = structs.CarParams.SafetyModel.gm
+    expected_model_raw = self._enum_raw(expected_model)
+    pandas = []
+    gm_camera_long_ready = False
+    controls_allowed = False
+    controls_allowed_lateral = False
+    controls_allowed_longitudinal = False
+
+    for panda_state in panda_states:
+      safety_model = getattr(panda_state, "safetyModel", None)
+      safety_model_raw = self._enum_raw(safety_model)
+      safety_model_name = self._enum_name(safety_model)
+      safety_param = int(getattr(panda_state, "safetyParam", 0) or 0)
+      controls = bool(getattr(panda_state, "controlsAllowed", False))
+      controls_lat = bool(getattr(panda_state, "controlsAllowedLateral", controls))
+      controls_long = bool(getattr(panda_state, "controlsAllowedLongitudinal", controls))
+      safety_model_matches = (
+        safety_model_raw == expected_model_raw
+        or safety_model_name == "gm"
+        or safety_model_name.endswith(".gm")
+      )
+      camera_long = (
+        safety_model_matches
+        and (safety_param & GM_CAMERA_LONG_SAFETY_PARAM) == GM_CAMERA_LONG_SAFETY_PARAM
+      )
+      gm_camera_long_ready = gm_camera_long_ready or camera_long
+      controls_allowed = controls_allowed or controls
+      controls_allowed_lateral = controls_allowed_lateral or controls_lat
+      controls_allowed_longitudinal = controls_allowed_longitudinal or controls_long
+      pandas.append({
+        "safetyModel": safety_model_name,
+        "safetyModelRaw": safety_model_raw,
+        "safetyParam": safety_param,
+        "safetyParamHex": hex(safety_param),
+        "controlsAllowed": controls,
+        "controlsAllowedLateral": controls_lat,
+        "controlsAllowedLongitudinal": controls_long,
+        "gmCameraLong": camera_long,
+      })
+
+    if not gm_camera_long_ready:
+      reason = "wrong GM safety mode"
+    elif not controls_allowed:
+      reason = "panda controls not allowed"
+    elif not controls_allowed_lateral:
+      reason = "panda lateral not allowed"
+    elif not controls_allowed_longitudinal:
+      reason = "panda longitudinal not allowed"
+    elif not alive or not valid:
+      reason = "panda state not alive/valid"
+    else:
+      reason = "ready"
+
+    ready = bool(
+      alive
+      and valid
+      and gm_camera_long_ready
+      and controls_allowed
+      and controls_allowed_lateral
+      and controls_allowed_longitudinal
+    )
+    return {
+      "seen": seen,
+      "alive": alive,
+      "valid": valid,
+      "ready": ready,
+      "reason": reason,
+      "expectedSafetyModel": "gm",
+      "expectedSafetyParamMask": GM_CAMERA_LONG_SAFETY_PARAM,
+      "expectedSafetyParamMaskHex": hex(GM_CAMERA_LONG_SAFETY_PARAM),
+      "gmCameraLongReady": gm_camera_long_ready,
+      "controlsAllowed": controls_allowed,
+      "controlsAllowedLateral": controls_allowed_lateral,
+      "controlsAllowedLongitudinal": controls_allowed_longitudinal,
+      "pandas": pandas,
+    }
 
   @staticmethod
   def _stack_history(history: deque, shape: tuple[int, ...]) -> np.ndarray:
@@ -721,6 +872,7 @@ class LiveSampler(threading.Thread):
       car_state_updated = bool(self._sm.updated.get("carState", False))
       car_state_alive = bool(self._sm.alive.get("carState", False))
       car_state_valid = bool(self._sm.valid.get("carState", False))
+    panda_safety = self._panda_safety_snapshot()
     self._update_powertrain_controls_from_can()
 
     # Real vehicle state from carState cereal message
@@ -792,8 +944,10 @@ class LiveSampler(threading.Thread):
         "loopback_lka_updated": self._loopback_lka_steering_cmd_updated,
         "cam_lka_counter": self._cam_lka_steering_cmd_counter,
         "pt_lka_counter": self._pt_lka_steering_cmd_counter,
+        "panda_safety": panda_safety,
       },
       gm_live_state=cs_actual,
+      panda_safety=panda_safety,
       car_control=car_control,
       car_state=car_state,
       timestamp=now,
@@ -813,6 +967,7 @@ class LiveSampler(threading.Thread):
       actual={"speed": 0.0, "throttle": 0.0, "brake": 0.0, "steering": 0.0, "steering_torque": 0.0,
               "eps_torque": 0.0, "standstill": True, "source": "stub"},
       gm_live_state={},
+      panda_safety={"seen": False, "ready": False, "reason": "stub sample"},
       car_control=None,
       car_state=None,
       image=None,
@@ -849,6 +1004,7 @@ class TinygradOnnxSession:
   def __init__(self, onnx_path: Path) -> None:
     if OnnxRunner is None or Tensor is None:
       raise RuntimeError("tinygrad is not available on this system")
+    _patch_tinygrad_cache_for_threads()
     self.onnx_path = Path(onnx_path)
     self.model = OnnxRunner(str(self.onnx_path))
     self.model_type = type(self.model).__name__
@@ -1310,7 +1466,16 @@ class ShadowInferenceWorker(threading.Thread):
     accel = ShadowInferenceWorker._model_accel_request(predicted_gated)
     return _ShadowCarControl(steering, accel, active)
 
-  def _actuator_reason(self, requested: bool, allowed: bool, previewed: bool, live_ready: bool) -> str:
+  def _actuator_reason(
+    self,
+    requested: bool,
+    allowed: bool,
+    previewed: bool,
+    live_ready: bool,
+    live_reason: str,
+    safety_ready: bool,
+    safety_reason: str,
+  ) -> str:
     if allowed:
       return "allowed"
     if not previewed:
@@ -1322,7 +1487,9 @@ class ShadowInferenceWorker(threading.Thread):
     if self._sendcan is None:
       return "sendcan unavailable"
     if not live_ready:
-      return "live control unavailable"
+      return live_reason or "live control unavailable"
+    if not safety_ready:
+      return safety_reason or "blocked by panda safety"
     return "not allowed"
 
   def _build_actuator_map(self, sample: LiveSample, predicted_gated: dict[str, Any]) -> dict[str, Any]:
@@ -1334,9 +1501,51 @@ class ShadowInferenceWorker(threading.Thread):
     )
     previewed = bool(actuator_map.get("previewed"))
     can_transmit = bool(self._sendcan is not None and can_list_to_can_capnp is not None)
-    live_ready = bool(sample.car_control is not None and sample.car_state is not None and sample.gm_live_state)
-    allowed = bool(requested and SHADOWMODE_ENABLE_ACTUATION and can_transmit and previewed and live_ready)
+    actual = dict(sample.actual or {})
+    car_state_seen = bool(actual.get("car_state_seen", False))
+    car_state_alive = bool(actual.get("car_state_alive", False))
+    car_state_valid = bool(actual.get("car_state_valid", False))
+    car_state_age = actual.get("car_state_age_seconds")
+    car_state_fresh = (
+      isinstance(car_state_age, (int, float))
+      and float(car_state_age) <= LIVE_SAMPLER_STALE_S
+    )
+    if not car_state_seen:
+      live_reason = "waiting for carState"
+    elif not car_state_alive:
+      live_reason = "carState not alive"
+    elif not car_state_valid:
+      live_reason = "carState invalid"
+    elif not car_state_fresh:
+      live_reason = f"carState stale ({float(car_state_age):.1f}s)" if isinstance(car_state_age, (int, float)) else "carState stale"
+    elif sample.car_control is None:
+      live_reason = "waiting for carControl"
+    elif not sample.gm_live_state:
+      live_reason = "GM live state unavailable"
+    else:
+      live_reason = "ready"
+    live_ready = bool(
+      sample.car_control is not None
+      and sample.car_state is not None
+      and sample.gm_live_state
+      and car_state_alive
+      and car_state_valid
+      and car_state_fresh
+    )
+    panda_safety = dict(sample.panda_safety or {})
+    safety_ready = bool(panda_safety.get("ready", False))
+    safety_reason = str(panda_safety.get("reason", "panda safety unavailable"))
+    can_accepted_observed = bool(sample.gm_live_state.get("loopback_lka_steering_cmd_updated", False))
+    allowed = bool(
+      requested
+      and SHADOWMODE_ENABLE_ACTUATION
+      and can_transmit
+      and previewed
+      and live_ready
+      and safety_ready
+    )
     can_msgs = []
+    published_to_sendcan = False
 
     if allowed:
       model_cc = self._model_car_control(sample.car_control, predicted_gated, active=True)
@@ -1347,17 +1556,38 @@ class ShadowInferenceWorker(threading.Thread):
       )
       if can_msgs:
         self._sendcan.send(can_list_to_can_capnp(can_msgs, msgtype="sendcan"))
+        published_to_sendcan = True
 
-    transmitting = bool(allowed and can_msgs)
+    transmitting = bool(allowed and published_to_sendcan)
     actuator_map.update({
       "previewed": previewed,
       "requested": requested,
       "allowed": allowed,
       "transmitting": transmitting,
+      "publishedToSendcan": published_to_sendcan,
+      "canAcceptedObserved": can_accepted_observed,
       "canTransmit": can_transmit,
       "liveReady": live_ready,
+      "liveReason": live_reason,
+      "carStateAlive": car_state_alive,
+      "carStateValid": car_state_valid,
+      "carStateAgeSeconds": car_state_age,
+      "safetyReady": safety_ready,
+      "safety": panda_safety,
       "hard_gate": bool(SHADOWMODE_ENABLE_ACTUATION),
-      "reason": "transmitting" if transmitting else self._actuator_reason(requested, allowed, previewed, live_ready),
+      "reason": (
+        "transmitting"
+        if transmitting
+        else self._actuator_reason(
+          requested,
+          allowed,
+          previewed,
+          live_ready,
+          live_reason,
+          safety_ready,
+          safety_reason,
+        )
+      ),
       "canMessageCount": len(can_msgs),
     })
     return actuator_map
