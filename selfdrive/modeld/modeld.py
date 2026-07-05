@@ -36,6 +36,22 @@ from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
+from openpilot.selfdrive.controls.irl_policy import (
+  _OnnxSession,
+  ACCEL_MAX,
+  ACCEL_MIN,
+  CONTROL_HISTORY_DIM,
+  IMAGE_HEIGHT,
+  IMAGE_WIDTH,
+  POLICY_PATH as IRL_POLICY_PATH,
+  SPEED_SCALE_MS,
+  STACK_SIZE,
+  STEERING_ANGLE_SCALE_DEG,
+  STEERING_RATE_SCALE_DEG,
+  VAE_LATENT_DIM,
+  VAE_PATH as IRL_ENCODER_PATH,
+  IrlPolicyController,
+)
 
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
@@ -52,6 +68,7 @@ MIN_LAT_CONTROL_SPEED = 0.3
 
 IMG_QUEUE_SHAPE = (6*(ModelConstants.MODEL_RUN_FREQ//ModelConstants.MODEL_CONTEXT_FREQ + 1), 128, 256)
 assert IMG_QUEUE_SHAPE[0] == 30
+IRL_MODELD_ENABLED = os.getenv("IRL_MODELD_ENABLED", "1") not in ("0", "false", "False")
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
@@ -242,6 +259,167 @@ class ModelState(ModelStateBase):
     return combined_outputs_dict
 
 
+class IrlModelState(ModelStateBase):
+  vision_input_names = ["img"]
+
+  def __init__(self):
+    ModelStateBase.__init__(self)
+    self.LAT_SMOOTH_SECONDS = LAT_SMOOTH_SECONDS
+    self.encoder = _OnnxSession(IRL_ENCODER_PATH)
+    self.policy = _OnnxSession(IRL_POLICY_PATH)
+    self.image_latents: list[np.ndarray] = []
+    self.telemetry: list[np.ndarray] = []
+    self.control_history: list[np.ndarray] = []
+    self.last_prediction = {"steering": 0.0, "accel": 0.0, "state": 0}
+    cloudlog.warning("IRL modeld loaded encoder=%s policy=%s", IRL_ENCODER_PATH, IRL_POLICY_PATH)
+
+  @staticmethod
+  def _resize_rgb_nearest(image: np.ndarray) -> np.ndarray:
+    y_idx = np.linspace(0, image.shape[0] - 1, IMAGE_HEIGHT).astype(np.int32)
+    x_idx = np.linspace(0, image.shape[1] - 1, IMAGE_WIDTH).astype(np.int32)
+    return image[y_idx][:, x_idx].astype(np.uint8)
+
+  @staticmethod
+  def _yuv_to_rgb(y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    ul = np.repeat(np.repeat(u, 2).reshape(u.shape[0], y.shape[1]), 2, axis=0).reshape(y.shape)
+    vl = np.repeat(np.repeat(v, 2).reshape(v.shape[0], y.shape[1]), 2, axis=0).reshape(y.shape)
+    yuv = np.dstack((y, ul, vl)).astype(np.int16)
+    yuv[:, :, 1:] -= 128
+    matrix = np.array([
+      [1.00000, 1.00000, 1.00000],
+      [0.00000, -0.39465, 2.03211],
+      [1.13983, -0.58060, 0.00000],
+    ])
+    return np.dot(yuv, matrix).clip(0, 255).astype(np.uint8)
+
+  @classmethod
+  def _buf_to_rgb(cls, buf: VisionBuf) -> np.ndarray:
+    uv_height = ((buf.height // 2) + 15) // 16 * 16
+    uv_plane_size = buf.stride * uv_height
+    y = np.array(buf.data[:buf.uv_offset], dtype=np.uint8).reshape((-1, buf.stride))[:buf.height, :buf.width]
+    uv_data = buf.data[buf.uv_offset:buf.uv_offset + uv_plane_size]
+    u = np.array(uv_data[::2], dtype=np.uint8).reshape((-1, buf.stride // 2))[:buf.height // 2, :buf.width // 2]
+    v = np.array(uv_data[1::2], dtype=np.uint8).reshape((-1, buf.stride // 2))[:buf.height // 2, :buf.width // 2]
+    return cls._resize_rgb_nearest(cls._yuv_to_rgb(y, u, v))
+
+  @staticmethod
+  def _append(history: list[np.ndarray], value: np.ndarray) -> None:
+    history.append(value.astype(np.float32))
+    del history[:-STACK_SIZE]
+
+  @staticmethod
+  def _stack(history: list[np.ndarray], shape: tuple[int, ...]) -> np.ndarray:
+    if not history:
+      values = [np.zeros(shape, dtype=np.float32)] * STACK_SIZE
+    else:
+      values = [history[0]] * (STACK_SIZE - len(history)) + history
+    return np.asarray(values, dtype=np.float32).reshape((1, STACK_SIZE, *shape))
+
+  @staticmethod
+  def _policy_to_curvature(steering: float, v_ego: float) -> float:
+    # The IRL policy's steering output is a normalized steering-wheel target.
+    # Convert it to a conservative road curvature proxy for the existing lateral stack.
+    target_angle_rad = np.deg2rad(float(np.clip(steering, -1.0, 1.0)) * STEERING_ANGLE_SCALE_DEG)
+    steer_ratio = 16.8
+    wheelbase = 2.6
+    curvature = target_angle_rad / max(steer_ratio * wheelbase, 1e-3)
+    max_curvature = 3.0 / max(float(v_ego) ** 2, 1.0)
+    return float(np.clip(curvature, -max_curvature, max_curvature))
+
+  @staticmethod
+  def _empty_model_output(v_ego: float, accel: float, curvature: float) -> dict[str, np.ndarray]:
+    t = np.asarray(ModelConstants.T_IDXS, dtype=np.float32)
+    x = np.maximum(0.0, float(v_ego) * t + 0.5 * float(accel) * t * t)
+    v = np.maximum(0.0, float(v_ego) + float(accel) * t)
+    a = np.full_like(t, float(accel), dtype=np.float32)
+    yaw = 0.5 * float(curvature) * max(float(v_ego), 1.0) * t
+
+    plan = np.zeros((1, ModelConstants.IDX_N, ModelConstants.PLAN_WIDTH), dtype=np.float32)
+    plan[0, :, Plan.POSITION] = np.stack([x, np.zeros_like(x), np.zeros_like(x)], axis=1)
+    plan[0, :, Plan.VELOCITY] = np.stack([v, np.zeros_like(v), np.zeros_like(v)], axis=1)
+    plan[0, :, Plan.ACCELERATION] = np.stack([a, np.zeros_like(a), np.zeros_like(a)], axis=1)
+    plan[0, :, Plan.T_FROM_CURRENT_EULER] = np.stack([np.zeros_like(yaw), np.zeros_like(yaw), yaw], axis=1)
+    plan[0, :, Plan.ORIENTATION_RATE] = 0.0
+
+    line_x = np.asarray(ModelConstants.X_IDXS, dtype=np.float32)
+    lane_lines = np.zeros((1, ModelConstants.NUM_LANE_LINES, ModelConstants.IDX_N, 2), dtype=np.float32)
+    for i, y_off in enumerate((-1.8, -0.6, 0.6, 1.8)):
+      lane_lines[0, i, :, 0] = y_off
+      lane_lines[0, i, :, 1] = 0.0
+    road_edges = np.zeros((1, ModelConstants.NUM_ROAD_EDGES, ModelConstants.IDX_N, 2), dtype=np.float32)
+    road_edges[0, 0, :, 0] = -3.7
+    road_edges[0, 1, :, 0] = 3.7
+
+    return {
+      "plan": plan,
+      "plan_stds": np.ones_like(plan) * 0.1,
+      "lane_lines": lane_lines,
+      "lane_lines_stds": np.ones((1, ModelConstants.NUM_LANE_LINES, 1, 1), dtype=np.float32),
+      "lane_lines_prob": np.asarray([[0.0, 0.2, 0.0, 0.6, 0.0, 0.6, 0.0, 0.2]], dtype=np.float32),
+      "road_edges": road_edges,
+      "road_edges_stds": np.ones((1, ModelConstants.NUM_ROAD_EDGES, 1, 1), dtype=np.float32),
+      "lead": np.zeros((1, 3, ModelConstants.LEAD_TRAJ_LEN, ModelConstants.LEAD_WIDTH), dtype=np.float32),
+      "lead_stds": np.ones((1, 3, ModelConstants.LEAD_TRAJ_LEN, ModelConstants.LEAD_WIDTH), dtype=np.float32),
+      "lead_prob": np.zeros((1, 3), dtype=np.float32),
+      "desire_state": np.zeros((1, ModelConstants.DESIRE_LEN), dtype=np.float32),
+      "desire_pred": np.zeros((1, ModelConstants.DESIRE_PRED_LEN, ModelConstants.DESIRE_LEN), dtype=np.float32),
+      "meta": np.zeros((1, 55), dtype=np.float32),
+      "pose": np.zeros((1, ModelConstants.POSE_WIDTH), dtype=np.float32),
+      "pose_stds": np.ones((1, ModelConstants.POSE_WIDTH), dtype=np.float32),
+      "wide_from_device_euler": np.zeros((1, ModelConstants.WIDE_FROM_DEVICE_WIDTH), dtype=np.float32),
+      "wide_from_device_euler_stds": np.ones((1, ModelConstants.WIDE_FROM_DEVICE_WIDTH), dtype=np.float32),
+      "road_transform": np.zeros((1, ModelConstants.POSE_WIDTH), dtype=np.float32),
+      "road_transform_stds": np.ones((1, ModelConstants.POSE_WIDTH), dtype=np.float32),
+    }
+
+  def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
+          inputs: dict[str, np.ndarray], prepare_only: bool) -> dict[str, np.ndarray] | None:
+    if prepare_only:
+      return None
+
+    v_ego = float(inputs.get("v_ego", 0.0))
+    steering_angle_deg = float(inputs.get("steering_angle_deg", 0.0))
+    steering_rate_deg = float(inputs.get("steering_rate_deg", 0.0))
+    gas = float(inputs.get("gas", 0.0))
+    brake_pressed = float(inputs.get("brake_pressed", 0.0))
+
+    rgb = self._buf_to_rgb(next(iter(bufs.values())))
+    encoder_input = rgb.reshape((1, IMAGE_HEIGHT, IMAGE_WIDTH, 3)).astype(np.uint8)
+    encoder_name = self.encoder.input_names[0] if self.encoder.input_names else "image"
+    latent = IrlPolicyController._select_latent(self.encoder.run({encoder_name: encoder_input}))
+    self._append(self.image_latents, latent.reshape((VAE_LATENT_DIM,)))
+    self._append(self.telemetry, np.asarray([np.clip(v_ego / SPEED_SCALE_MS, 0.0, 2.0)], dtype=np.float32))
+    self._append(self.control_history, np.asarray([
+      np.clip(gas, 0.0, 1.0),
+      np.clip(brake_pressed, 0.0, 1.0),
+      np.clip(steering_angle_deg / STEERING_ANGLE_SCALE_DEG, -1.0, 1.0),
+      np.clip(steering_rate_deg / STEERING_RATE_SCALE_DEG, -1.0, 1.0),
+    ], dtype=np.float32))
+
+    policy_inputs_all = {
+      "image_latent": self._stack(self.image_latents, (VAE_LATENT_DIM,)),
+      "telemetry": self._stack(self.telemetry, (1,)),
+      "control_history": self._stack(self.control_history, (CONTROL_HISTORY_DIM,)),
+    }
+    policy_inputs = {name: policy_inputs_all[name] for name in (self.policy.input_names or policy_inputs_all.keys()) if name in policy_inputs_all}
+    prediction = IrlPolicyController._decode_policy(self.policy.run(policy_inputs))
+    prediction["accel"] = float(np.clip(prediction["accel"], ACCEL_MIN, ACCEL_MAX))
+    self.last_prediction = prediction
+
+    curvature = self._policy_to_curvature(prediction["steering"], v_ego)
+    return self._empty_model_output(v_ego, prediction["accel"], curvature)
+
+  def get_action(self, model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action, v_ego: float) -> log.ModelDataV2.Action:
+    prediction = self.last_prediction
+    desired_curvature = self._policy_to_curvature(float(prediction.get("steering", 0.0)), v_ego)
+    desired_accel = float(np.clip(prediction.get("accel", 0.0), ACCEL_MIN, ACCEL_MAX))
+    return log.ModelDataV2.Action(
+      desiredCurvature=desired_curvature,
+      desiredAcceleration=desired_accel,
+      shouldStop=bool(v_ego < 0.3 and desired_accel < 0.1),
+    )
+
+
 def main(demo=False):
   cloudlog.warning("modeld init")
 
@@ -252,7 +430,7 @@ def main(demo=False):
 
   st = time.monotonic()
   cloudlog.warning("loading model")
-  model = ModelState()
+  model = IrlModelState() if IRL_MODELD_ENABLED else ModelState()
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # visionipc clients
@@ -385,6 +563,11 @@ def main(demo=False):
     inputs:dict[str, np.ndarray] = {
       'desire_pulse': vec_desire,
       'traffic_convention': traffic_convention,
+      'v_ego': v_ego,
+      'gas': float(sm["carState"].gas),
+      'brake_pressed': float(sm["carState"].brakePressed),
+      'steering_angle_deg': float(sm["carState"].steeringAngleDeg),
+      'steering_rate_deg': float(sm["carState"].steeringRateDeg),
     }
 
     mt1 = time.perf_counter()
@@ -400,7 +583,10 @@ def main(demo=False):
 
       frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
       action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
-      action = get_action_from_model(model_output, prev_action, lat_delay + frame_delay + action_delay, long_delay + frame_delay + action_delay, v_ego)
+      if hasattr(model, "get_action"):
+        action = model.get_action(model_output, prev_action, v_ego)
+      else:
+        action = get_action_from_model(model_output, prev_action, lat_delay + frame_delay + action_delay, long_delay + frame_delay + action_delay, v_ego)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,

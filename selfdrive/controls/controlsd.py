@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import os
 from numbers import Number
 
 from cereal import car, log
@@ -51,7 +52,8 @@ class Controls(ControlsExt):
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
-    self.irl_policy = IrlPolicyController(self.CP)
+    self.irl_modeld_enabled = os.getenv("IRL_MODELD_ENABLED", "1") not in ("0", "false", "False")
+    self.irl_policy = None if self.irl_modeld_enabled else IrlPolicyController(self.CP)
     self.irl_policy_last_log_frame = 0
 
     self.pose_calibrator = PoseCalibrator()
@@ -152,7 +154,7 @@ class Controls(ControlsExt):
     actuators.torque = float(steer)
     actuators.steeringAngleDeg = float(steeringAngleDeg)
 
-    irl_policy_decision = self.irl_policy.apply_cached(CC, CS)
+    irl_policy_decision = self.irl_policy.apply_cached(CC, CS) if self.irl_policy is not None else {"applied": False}
     if irl_policy_decision["applied"] and self.sm.frame - self.irl_policy_last_log_frame > int(5.0 / DT_CTRL):
       self.irl_policy_last_log_frame = self.sm.frame
       cloudlog.warning(
