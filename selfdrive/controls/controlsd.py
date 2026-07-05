@@ -19,6 +19,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
+from openpilot.selfdrive.controls.irl_policy import IrlPolicyController
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 
@@ -50,6 +51,8 @@ class Controls(ControlsExt):
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.irl_policy = IrlPolicyController(self.CP)
+    self.irl_policy_last_log_frame = 0
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -148,6 +151,20 @@ class Controls(ControlsExt):
                                                        self.calibrated_pose, curvature_limited, lat_delay)
     actuators.torque = float(steer)
     actuators.steeringAngleDeg = float(steeringAngleDeg)
+
+    irl_policy_decision = self.irl_policy.apply_cached(CC, CS)
+    if irl_policy_decision["applied"] and self.sm.frame - self.irl_policy_last_log_frame > int(5.0 / DT_CTRL):
+      self.irl_policy_last_log_frame = self.sm.frame
+      cloudlog.warning(
+        "IRL policy actuator source=%s reason=%s accel=%.3f torque=%.3f latActive=%s longActive=%s",
+        irl_policy_decision["source"],
+        irl_policy_decision["reason"],
+        actuators.accel,
+        actuators.torque,
+        CC.latActive,
+        CC.longActive,
+      )
+
     # Ensure no NaNs/Infs
     for p in ACTUATOR_FIELDS:
       attr = getattr(actuators, p)
